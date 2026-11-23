@@ -37,7 +37,9 @@ public:
 
     /// `timed` false: round times are not read, every round costs the prior shape of its size, so the picks follow the
     /// drafts' outcomes alone (the same tokens give the same windows on every run).
-    explicit DraftPolicy(int max_t, double margin = 0.03, bool timed = true);
+    /// (Lapilli) `v100_shape`: the prior shape measured on a V100 main card (draft_policy.cpp, kShapeV70) instead of
+    /// Basalt's; the caller asks for it (this library has no GPU).
+    explicit DraftPolicy(int max_t, double margin = 0.03, bool timed = true, bool v100_shape = false);
 
     struct Pick {
         bool lookup = false;
@@ -80,6 +82,7 @@ private:
     int max_t_;
     double margin_;
     bool timed_;
+    const double* shape_;   // the prior shape by window size (kShape, or kShapeV70 on a V100 main card)
     double scale_ = 0.0;                                   // round ms = scale x base(size)
     std::array<double, kMaxT + 1> base_{}, base_n_{};      // by window size; rounds behind it
     std::array<long, kMaxT + 1> seen_{};                   // the round each size was last measured

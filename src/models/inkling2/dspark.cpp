@@ -10,6 +10,7 @@
 #include "basalt/core/diag.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/kernels/dense_ops.hpp"
+#include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
@@ -33,6 +34,28 @@
 
 namespace basalt::models::inkling2 {
 namespace {
+
+// (Lapilli) the drafter runs on a card without FP4 window gemms (a V100) through its Q8_0 path (DsparkWeights::q8_products),
+// on by default since it was measured on a V100 (109 / 213 / 95 tok/s on the bench's conv / struct / prose
+// against 77 / 75 / 78 without it, the same greedy text with and without it, inkling2_dspark_parity passing);
+// BASALT_INK_DSPARK_V70=0 (read once) leaves it off there (dspark_finish_flags)
+bool v70_drafter_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("BASALT_INK_DSPARK_V70");
+        return !(e != nullptr && e[0] == '0' && e[1] == 0);
+    }();
+    return v;
+}
+// (Lapilli) the current card runs the window gemm's FP4 products (compute capability 10.0 and later)
+bool fp4_window_card() {
+    int dev = 0, major = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return major >= 10;
+}
+
 
 namespace bk = basalt::kernels;
 
@@ -253,11 +276,14 @@ model::Result DsparkWeights::finish(const void* head_q8, const uint16_t* emb, co
         dspark_screen_pack(fold, kDsRank, n_vocab, fold_sc, s);
         dspark_screen_order(fold_b, n_vocab, fold_bp, s);
         // the block's products rounded from their Q8_0 to NVFP4 planes in place (the planes are shorter), through a copy of
-        // each: the drafts' precision only, every draft is verified exactly; about half the bytes a block reads
+        // each: the drafts' precision only, every draft is verified exactly; about half the bytes a block reads.
+        // (Lapilli) A card without FP4 window gemms keeps them in Q8_0 for native_q8_0_mmvq (q8_products).
+        q8_products = !fp4_window_card();
         const uint64_t ff = (uint64_t) geo.n_ff;
         void* tmp = nullptr;
         if (cudaMalloc(&tmp, q8_bytes(ff, kE)) != cudaSuccess) throw std::runtime_error("out of device memory rounding its products");
         for (DsparkLayer& L : layer) {
+            if (q8_products) break;
             const struct { void* w; uint64_t rows, K; } m[kFp4Mats] = {
                 {L.wq, kQ, kE}, {L.wk, kKV, kE}, {L.wv, kKV, kE}, {L.wo, kE, kQ}, {L.gate, ff, kE}, {L.up, ff, kE}, {L.down, kE, ff}};
             for (int i = 0; i < kFp4Mats; ++i) {
@@ -306,6 +332,8 @@ uint64_t dspark_session_bytes(const Pack& pack, int64_t context) {
         n += 2ull * (uint64_t) (d.swa[(size_t) l] ? ring_cells(d) : full_cells(context)) * kKV * 2;
     n += (2 * R * E + 3 * R * kQ) * 4;                                             // the block's rows
     n += 2 * bk::wgemm::act_bytes((int64_t) std::max<uint64_t>(ff, kQ)) + dspark_ws_bytes(d) + 1024;   // the window gemm's
+    n += bk::native_q8_1_bytes(kE, kDsBlock) + bk::native_q8_1_bytes(kQ, kDsBlock) + bk::native_q8_1_bytes((int) ff, kDsBlock) +
+         (2 * R * E + 2 * R * ff) * 4 + 1024;                                   // (Lapilli) the V100 block's
     n += bk::gqa_decode_scratch_floats(std::max(ring_cells(d), full_cells(context)), kDsBlock, kHeads, kHeadDim) * 4;
     n += ((uint64_t) kDsDrafts * dspark_screen_rows((int64_t) V) + (uint64_t) kDsDrafts * kDsRnn + kDsRnn + 3 * kDsRank) * 4;   // the head's
     n += bk::native_q8_1_bytes(kE, kDsDrafts) + bk::native_q8_1_bytes(kDsRank, kDsDrafts) + dspark_head_scratch_bytes((int64_t) V) + 1024;
@@ -377,6 +405,17 @@ bool DsparkHook::init(const DsparkWeights* w, const Geometry& g, int64_t context
     attn_ = f(R * kQ);
     act_a_ = dev(bk::wgemm::act_bytes(kQ), ok);
     act_h_ = dev(bk::wgemm::act_bytes((int64_t) ff), ok);
+    // (Lapilli) the V100 block (v70_qkv, v70_post_attention): decided by the card, as finish() decides q8_products (a session
+    // starts before the weights are finished)
+    if (!fp4_window_card()) {
+        v70_a_ = dev(bk::native_q8_1_bytes(kE, kDsBlock), ok);
+        v70_ao_ = dev(bk::native_q8_1_bytes(kQ, kDsBlock), ok);
+        v70_ah_ = dev(bk::native_q8_1_bytes((int) ff, kDsBlock), ok);
+        v70_xn_ = f(R * E);
+        v70_t_ = f(R * E);
+        v70_g_ = f(R * ff);
+        v70_u_ = f(R * ff);
+    }
     {
         size_t pf = 0, tk = 0;
         ws_need(d, pf, tk);
@@ -520,6 +559,33 @@ void DsparkHook::note(int64_t pos0, int rows) {
     }
 }
 
+// (Lapilli) The block's products on a V100: its Q8_0 matrices (finish() kept them, q8_products) times the block's 8 rows
+// as q8_1, through native_q8_0_mmvq (dp4a; the drafter already runs its context projections there); the window gemm's
+// epilogues as their own steps: the products added to x, the SwiGLU between gate/up and down. The drafts' precision only:
+// every draft is verified by the target.
+void DsparkHook::v70_post_attention(const DsparkLayer& L, const DsparkGeometry& d, void* stream) {
+    const int ff = d.n_ff;
+    bk::native_quantize_q8_1(attn_, v70_ao_, kQ, kDsBlock, stream);
+    bk::native_q8_0_mmvq(L.wo, v70_ao_, v70_t_, kQ, kE, kDsBlock, stream);
+    bk::add_inplace(x_, v70_t_, (int64_t) kDsBlock * kE, stream);
+    bk::rms_norm_rows(x_, L.post_norm, kDsBlock, kE, d.rms_eps, v70_xn_, stream);
+    bk::native_quantize_q8_1(v70_xn_, v70_a_, kE, kDsBlock, stream);
+    bk::native_q8_0_mmvq(L.gate, v70_a_, v70_g_, kE, ff, kDsBlock, stream);
+    bk::native_q8_0_mmvq(L.up, v70_a_, v70_u_, kE, ff, kDsBlock, stream);
+    dspark_swiglu_v70(v70_g_, v70_u_, v70_g_, (int64_t) kDsBlock * ff, stream);
+    bk::native_quantize_q8_1(v70_g_, v70_ah_, ff, kDsBlock, stream);
+    bk::native_q8_0_mmvq(L.down, v70_ah_, v70_t_, ff, kE, kDsBlock, stream);
+    bk::add_inplace(x_, v70_t_, (int64_t) kDsBlock * kE, stream);
+}
+
+void DsparkHook::v70_qkv(const DsparkLayer& L, const DsparkGeometry& d, void* stream) {
+    bk::rms_norm_rows(x_, L.attn_norm, kDsBlock, kE, d.rms_eps, v70_xn_, stream);
+    bk::native_quantize_q8_1(v70_xn_, v70_a_, kE, kDsBlock, stream);
+    bk::native_q8_0_mmvq(L.wq, v70_a_, q_, kE, kQ, kDsBlock, stream);
+    bk::native_q8_0_mmvq(L.wk, v70_a_, kb_, kE, kKV, kDsBlock, stream);
+    bk::native_q8_0_mmvq(L.wv, v70_a_, vb_, kE, kKV, kDsBlock, stream);
+}
+
 // The block's stage k (0 .. layers): the post-attention half of layer k - 1 (k > 0), then the pre-attention half of layer k
 // (k < layers) or the final norm and the head's `n` drafts (k = layers). Everything a stage reads of the block's anchor and
 // position is on the device (meta_d_), so a stage is captured once and replayed.
@@ -535,6 +601,9 @@ void DsparkHook::stage(int k, int n, void* stream) {
     };
     if (k > 0) {   // x += o attn; x += down(silu(gate z) * up z), z = post_norm(x)
         const DsparkLayer& L = w.layer[(size_t) k - 1];
+        if (w.q8_products) {   // (Lapilli) the V100 block
+            v70_post_attention(L, d, stream);
+        } else {
         const float* sc = L.fp4_scale;
         wg::pack(attn_, kQ, kQ, kDsBlock, act_a_, stream);
         wg::Call o;
@@ -559,10 +628,14 @@ void DsparkHook::stage(int k, int n, void* stream) {
         dn.epi = wg::Epilogue::Add;
         dn.m[0] = mat(L.down, kE, sc + 6, x_, kE);
         wg::gemm(dn, act_h_, kDsBlock, ws_, stream);
+        }
     }
     if (k < d.n_layers) {
         const DsparkLayer& L = w.layer[(size_t) k];
         const Cache& c = cache_[(size_t) k];
+        if (w.q8_products) {   // (Lapilli) the V100 block
+            v70_qkv(L, d, stream);
+        } else {
         const float* sc = L.fp4_scale;
         wg::norm_pack(x_, L.attn_norm, d.rms_eps, kE, kDsBlock, act_a_, nullptr, stream);
         wg::Call qkv;
@@ -573,6 +646,7 @@ void DsparkHook::stage(int k, int n, void* stream) {
         qkv.m[1] = mat(L.wk, kKV, sc + 1, kb_, kKV);
         qkv.m[2] = mat(L.wv, kKV, sc + 2, vb_, kKV);
         wg::gemm(qkv, act_a_, kDsBlock, ws_, stream);
+        }
         bk::attn_qk_prepare(q_, kb_, vb_, L.q_norm, L.k_norm, d.rms_eps, rope_of(d), pos3b_, kDsBlock, kHeads, kKvHeads, qr_, c.k, c.v,
                             0, stream, kHeadDim, false, c.cap, meta_d_ + 1);
         return;
@@ -624,6 +698,8 @@ bool DsparkHook::stage_graph(int k, int n, void* stream) {
 
 model::Result DsparkHook::draft_begin(int32_t anchor, int64_t pos, int n, void* stream) {
     if (!w_) return {model::Status::NotImplemented, "inkling2: the pack has no drafter"};
+    if (w_->q8_products && v70_a_ == nullptr)   // (Lapilli) never the window gemm on a V100
+        return {model::Status::Error, "inkling2: the drafter's V100 buffers are missing"};
     pending_ = 0;
     n = std::min(n, kDsDrafts);
     // the Markov head's context is the row before the anchor's: kept for the last kFrRing positions run
@@ -795,6 +871,31 @@ void dspark_finish_flags(program::CommonOptions& o) {
     if (o.spec >= 2 && !present) {
         basalt::log::warn("basalt inkling2", "--spec %d off: the pack has no drafter", o.spec);
         o.spec = 0;
+    }
+    // (Lapilli) the drafter's products are Blackwell window gemms (NVFP4 planes): with a visible card below compute
+    // capability 10.0 (a V100) they go through its Q8_0 path instead (v70_drafter_on), or the drafter stays off with
+    // BASALT_INK_DSPARK_V70=0. Decoding gives the same tokens without it; only the speed differs.
+    if (o.spec >= 2) {
+        int n = 0, oldest = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess) {
+            cudaGetLastError();
+            n = 0;
+        }
+        for (int d = 0; d < n; ++d) {
+            int major = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess) {
+                cudaGetLastError();
+                continue;
+            }
+            if (oldest == 0 || major < oldest) oldest = major;
+        }
+        if (oldest > 0 && oldest < 10 && v70_drafter_on()) {
+            basalt::log::info("basalt inkling2", "--spec %d: the DSpark drafter's V100 path (Q8_0 block products through "
+                              "native_q8_0_mmvq; BASALT_INK_DSPARK_V70=0 turns it off)", o.spec);
+        } else if (oldest > 0 && oldest < 10) {
+            basalt::log::info("basalt inkling2", "--spec %d off: BASALT_INK_DSPARK_V70=0 (a card here is %d.x)", o.spec, oldest);
+            o.spec = 0;
+        }
     }
 }
 

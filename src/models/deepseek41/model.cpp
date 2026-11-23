@@ -285,9 +285,20 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
     }
     // The peer-tier kernels of this architecture are built for sm_120 only: refuse an older
     // peer card here rather than failing at its first launch with 'no kernel image'.
+    // (Lapilli) a build for the main card's own architecture (sm_70: every kernel compiled for the V100) runs them on a
+    // second card of that same compute capability: a V100 beside a V100 holds experts, as it did before this check came
+    // with Basalt's one-pass loader (the merge: "GPU 1 (Tesla V100-SXM2-32GB) is not sm_120").
+    int main_dev = 0, main_major = 0, main_minor = 0;
+    if (cudaGetDevice(&main_dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&main_major, cudaDevAttrComputeCapabilityMajor, main_dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&main_minor, cudaDevAttrComputeCapabilityMinor, main_dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        main_major = main_minor = 0;
+    }
     for (int dev : peers) {
         cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 && !(prop.major == 12 && prop.minor == 0))
+        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 && !(prop.major == 12 && prop.minor == 0) &&
+            !(main_major == 7 && prop.major == main_major && prop.minor == main_minor))
             return {model::Status::Error, "deepseek41: GPU " + std::to_string(dev) + " (" + prop.name +
                                               ") is not sm_120: the DeepSeek peer-tier kernels are built for Blackwell only"};
     }

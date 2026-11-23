@@ -46,6 +46,10 @@ void dspark_block_inputs(const uint16_t* embedding, const int32_t* meta, const f
 void dspark_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const uint16_t* w_sp, const uint16_t* w1_row,
                         const float* state_in, float* state_out, float* latent, void* stream);
 
+/// (Lapilli) h[i] = g[i] / (1 + exp(-g[i])) * u[i] for i < n: the window gemm's SwiGLU epilogue, for the block products
+/// the V100 runs through native_q8_0_mmvq (DsparkWeights::q8_products). `h` may be `g`.
+void dspark_swiglu_v70(const float* g, const float* u, float* h, int64_t n, void* stream);
+
 /// The draft head: draft i's logits l[v] = cap tanh((head_v . h + fold_v . lat + fold_b[v]) / cap) over v < n_vocab, h = block
 /// row i + 1 (q8_1, kWidth) and lat its latent (q8_1, kDsRank). Its argmax is screened (basalt/kernels/head_proxy.cuh) by
 /// 2-bit copies of the head and the fold: the copies score every row, the rows near the best are scored exactly, the exact

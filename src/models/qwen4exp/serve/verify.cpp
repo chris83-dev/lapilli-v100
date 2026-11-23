@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/verify.cpp - verify operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/models/qwen4exp/draft_shape.hpp"
 #include "qfn_state.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/elastic_kv.hpp"
@@ -223,7 +224,7 @@ int QfnRuntime::capture_windows() {
 
     rounds = 0;
     sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-    policy.emplace(S, 0.03, false);   // MTP or lookup window, learned over the whole process
+    policy.emplace(S, 0.03, false, draft_v100_shape());   // MTP or lookup window, learned over the whole process
     // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images and videos.  The
     // file is one or more basalt-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt
     // order, one per picture and one per two-frame video group; each record's rows go to its run of <|image_pad|> or

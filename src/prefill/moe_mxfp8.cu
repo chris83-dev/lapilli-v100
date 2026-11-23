@@ -1,5 +1,6 @@
 // src/prefill/moe_mxfp8.cu - see include/basalt/prefill/moe_mxfp8.hpp.
 #include "basalt/prefill/moe_mxfp8.hpp"
+#include "basalt/kernels/volta_sm100.hpp"   // (Lapilli) a V100 compiles this file, never launches it
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -40,17 +41,17 @@ size_t scale_off(int64_t rows, int64_t cols) { return ((size_t) rows * (size_t) 
 
 __device__ __forceinline__ unsigned smem_addr(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+    BASALT_SM100_ASM("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
 }
 __device__ __forceinline__ void cp_async4(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(smem_addr(dst)), "l"(src));
+    BASALT_SM100_ASM("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(smem_addr(dst)), "l"(src));
 }
 __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr(dst)), "l"(src));
+    BASALT_SM100_ASM("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr(dst)), "l"(src));
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void cp_commit() { BASALT_SM100_ASM("cp.async.commit_group;\n" ::); }
+template <int N> __device__ __forceinline__ void cp_wait() { BASALT_SM100_ASM("cp.async.wait_group %0;\n" ::"n"(N)); }
 __device__ __forceinline__ int swa(int rr, int lb) { return rr * kBK + (lb ^ ((rr & 7) << 4)); }
 
 template <int KS>
@@ -58,7 +59,7 @@ __device__ __forceinline__ void mma_mxfp8(float* c, const unsigned* a, unsigned 
                                           unsigned sfb) {
     constexpr unsigned short kBid = (unsigned short) KS;
     constexpr unsigned short kTid = 0;
-    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+    BASALT_SM100_ASM("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
@@ -85,7 +86,7 @@ __global__ void plan_blocks_kernel(const int32_t* __restrict__ bounds, int n, in
 
 __device__ __forceinline__ float fast_tanh(float x) {
     float r;
-    asm("tanh.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    BASALT_SM100_ASM("tanh.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
     return r;
 }
 

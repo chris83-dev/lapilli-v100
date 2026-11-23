@@ -57,6 +57,10 @@ bool block_meta(const GgufFile& gg, dense::BlockDrafter& d, int H, std::string& 
 // The device bytes a weight takes: its payload in its card's weight block, 256-byte aligned (load_weights carves every
 // tensor from one allocation per card, so the planner counts exactly what the load takes).
 uint64_t weight_bytes(const TensorInfo& t) { return (tensor_payload_bytes(t) + 255) & ~(uint64_t) 255; }
+// (Lapilli, V100) on a card without FP8 tensor cores an F8 matrix lands at the start of a region of its Q8_0 size, which
+// to_mmq fills with its Q8_0 once the weights have landed (attach)
+bool f8_to_q8(const TensorInfo& t) { return (int) t.type == kTypeF8 && !dense::fp4_hardware(); }
+uint64_t q8_region_bytes(const TensorInfo& t) { return ((uint64_t) t.elements() / 32 * 34 + 255) & ~(uint64_t) 255; }
 
 // Whether the load places tensor `name` on a card: the layers [lo, hi), and with lo == 0 the head and the drafter in use.
 bool on_card(const std::string& name, const dense::Options& o, int lo, int hi) {
@@ -143,6 +147,7 @@ public:
     }
 
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override {
+        if (std::string err; !run_mmq(err)) return {model::Status::Error, err};   // (Lapilli, V100) before anything reads them
         if (std::string err; !dense::attach_drafter(*model_, err)) return {model::Status::Error, err};
         if (stage_.device >= 0) attach_stage();
         for (int i = 0; i < std::max(req.sessions, 1); ++i) {
@@ -492,7 +497,7 @@ private:
     bool reserve_block(const GgufFile& gg, const dense::Options& o, int lo, int hi, std::string& err) {
         uint64_t bytes = 0;
         for (const TensorInfo& t : gg.tensors())
-            if (on_card(t.name, o, lo, hi)) bytes += weight_bytes(t);
+            if (on_card(t.name, o, lo, hi)) bytes += f8_to_q8(t) ? q8_region_bytes(t) : weight_bytes(t);
         int dev = 0;
         cudaGetDevice(&dev);
         Block& b = blocks_[dev];
@@ -519,6 +524,15 @@ private:
         void* d = it->second.base + it->second.used;
         it->second.used += need;
         ++n_tensors_;
+        return d;
+    }
+
+    // (Lapilli, V100) `t`'s bytes queued at the start of a region of `region` bytes (an F8 matrix: its Q8_0's, f8_to_q8)
+    void* upload_into(const GgufFile& gg, const TensorInfo& t, uint64_t region, std::string& err) {
+        void* d = take(region, t.name, err);
+        if (!d) return nullptr;
+        queue(gg, t, d);
+        dev_bytes_ += region;
         return d;
     }
 
@@ -580,7 +594,7 @@ private:
         l.type = type;
         l.rows = rows;
         l.cols = cols;
-        l.w = upload(gg, *t, err);
+        l.w = f8_to_q8(*t) ? upload_into(gg, *t, q8_region_bytes(*t), err) : upload(gg, *t, err);
         if (!l.w) return false;
         if (type == kTypeNvfp4Planes || type == kTypeF8) {
             auto sc = tensors_.find(base + ".scale");
@@ -592,70 +606,91 @@ private:
                 if (!l.scale) return false;
             }
         }
-        return dense::fp4_hardware() || to_mmq(base, l, err);
+        return dense::fp4_hardware() || plan_mmq(base, l, err);
     }
 
     // (Lapilli, V100) A card without FP4 / FP8 tensor cores (before Blackwell) runs every product on MMQ: NVFP4 planes
     // become ggml's NVFP4 blocks in place (the same bytes and codes; the tensor scale stays Linear::scale, which the step
-    // after MMQ applies), and an F8 matrix (the head) becomes Q8_0 with its row or tensor scale folded in, its E4M3 buffer
-    // given back.  The products' arithmetic changes (W4A8 / W8A8 against q8_1 rows): the quality gate measures it.
-    bool to_mmq(const std::string& base, dense::Linear& l, std::string& err) {
+    // after MMQ applies), and an F8 matrix (the head) becomes Q8_0 with its row or tensor scale folded in, in its region
+    // (f8_to_q8 sized it).  The products' arithmetic changes (W4A8 / W8A8 against q8_1 rows): the quality gate measures it.
+    // The plan only queues the reads (one pass, after the plan): plan_mmq checks the matrix and gives the Linear what it will
+    // hold (its type; no scales for Q8_0), and run_mmq makes the bytes at attach, once they have landed.  A step names the
+    // device memory, never the Linear: the plan's layers are copied into the model.
+    struct MmqStep {
+        std::string base;
+        int from = 0;
+        void* w = nullptr;
+        int64_t rows = 0, cols = 0;
+        const float* scale = nullptr;
+        const float* row_scales = nullptr;
+        int device = 0;
+    };
+    std::vector<MmqStep> mmq_steps_;
+
+    bool plan_mmq(const std::string& base, dense::Linear& l, std::string& err) {
+        MmqStep s;
+        s.base = base;
+        s.from = l.type;
+        s.w = const_cast<void*>(l.w);
+        s.rows = l.rows;
+        s.cols = l.cols;
+        s.scale = l.scale;
+        s.row_scales = l.row_scales;
+        cudaGetDevice(&s.device);
         if (l.type == kTypeNvfp4Planes) {
             if (!kernels::nvfp4p::fits(l.rows, l.cols)) {
                 err = "qwen35: " + base + " (" + std::to_string((long long) l.rows) + " x " + std::to_string((long long) l.cols) +
                       ") has no NVFP4 block layout";
                 return false;
             }
-            const size_t n = kernels::nvfp4p::bytes(l.rows, l.cols);
-            void* tmp = nullptr;
-            if (cudaMalloc(&tmp, n) != cudaSuccess) {
-                err = "qwen35: out of device memory turning " + base + " into NVFP4 blocks";
-                return false;
-            }
-            kernels::nvfp4p::to_blocks(l.w, l.rows, l.cols, tmp, nullptr);
-            const bool ok = cudaMemcpy(const_cast<void*>(l.w), tmp, n, cudaMemcpyDeviceToDevice) == cudaSuccess &&
-                            cudaDeviceSynchronize() == cudaSuccess;
-            cudaFree(tmp);
-            if (!ok) {
-                err = "qwen35: turning " + base + " into NVFP4 blocks failed";
-                return false;
-            }
             l.type = kTypeNvfp4;
-            return true;
-        }
-        if (l.type == kTypeF8) {
+        } else if (l.type == kTypeF8) {
             if (l.cols % 32 != 0) {
                 err = "qwen35: " + base + " has " + std::to_string((long long) l.cols) + " columns, not a multiple of 32 (Q8_0)";
                 return false;
             }
-            const size_t n = (size_t) l.rows * (size_t) l.cols / 32 * 34, old = (size_t) l.rows * (size_t) l.cols;
-            void* q = nullptr;
-            if (cudaMalloc(&q, n) != cudaSuccess) {
-                err = "qwen35: out of device memory turning " + base + " into Q8_0";
-                return false;
-            }
-            kernels::nvfp4p::e4m3_to_q8(l.w, l.row_scales, l.scale, l.rows, l.cols, q, nullptr);
-            if (cudaDeviceSynchronize() != cudaSuccess) {
-                cudaFree(q);
-                err = "qwen35: turning " + base + " into Q8_0 failed";
-                return false;
-            }
-            auto it = std::find(dev_.begin(), dev_.end(), const_cast<void*>(l.w));
-            if (it != dev_.end()) {
-                cudaFree(*it);
-                dev_.erase(it);
-                dev_bytes_ -= old;
-            }
-            dev_.push_back(q);
-            dev_bytes_ += n;
-            l.w = q;
             l.type = kTypeQ8_0;
             l.scale = nullptr;
             l.row_scales = nullptr;
-            basalt::log::info("basalt", "qwen35: %s in Q8_0 for this card (no FP8 tensor cores): %.2f GiB", base.c_str(),
-                              (double) n / 1073741824.0);
+        } else {
+            return true;
         }
+        mmq_steps_.push_back(std::move(s));
         return true;
+    }
+
+    // the conversions plan_mmq recorded, on the landed weights (attach, before anything reads them)
+    bool run_mmq(std::string& err) {
+        int dev0 = 0;
+        cudaGetDevice(&dev0);
+        bool ok = true;
+        for (const MmqStep& s : mmq_steps_) {
+            if (!ok) break;
+            cudaSetDevice(s.device);
+            const size_t n = s.from == kTypeNvfp4Planes ? kernels::nvfp4p::bytes(s.rows, s.cols) : (size_t) s.rows * (size_t) s.cols;
+            void* tmp = nullptr;
+            if (cudaMalloc(&tmp, n) != cudaSuccess) {
+                err = "qwen35: out of device memory turning " + s.base + (s.from == kTypeF8 ? " into Q8_0" : " into NVFP4 blocks");
+                ok = false;
+                break;
+            }
+            if (s.from == kTypeNvfp4Planes) {
+                kernels::nvfp4p::to_blocks(s.w, s.rows, s.cols, tmp, nullptr);
+                ok = cudaMemcpy(s.w, tmp, n, cudaMemcpyDeviceToDevice) == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
+            } else {   // the E4M3 bytes out of the region, then its Q8_0 into it
+                ok = cudaMemcpy(tmp, s.w, n, cudaMemcpyDeviceToDevice) == cudaSuccess;
+                if (ok) kernels::nvfp4p::e4m3_to_q8(tmp, s.row_scales, s.scale, s.rows, s.cols, s.w, nullptr);
+                ok = ok && cudaDeviceSynchronize() == cudaSuccess;
+                if (ok)
+                    basalt::log::info("basalt", "qwen35: %s in Q8_0 for this card (no FP8 tensor cores): %.2f GiB", s.base.c_str(),
+                                      (double) ((size_t) s.rows * (size_t) s.cols / 32 * 34) / 1073741824.0);
+            }
+            cudaFree(tmp);
+            if (!ok) err = "qwen35: turning " + s.base + (s.from == kTypeF8 ? " into Q8_0" : " into NVFP4 blocks") + " failed";
+        }
+        mmq_steps_.clear();
+        cudaSetDevice(dev0);
+        return ok;
     }
 
     model::ModelDesc desc_;

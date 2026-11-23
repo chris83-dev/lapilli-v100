@@ -510,7 +510,12 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     __syncthreads();
     px::pick_block<false>(f, n, n_tiles, nullptr, part, prev, conf + i);
     __syncthreads();
-    const int pick = *prev;
+    // (Lapilli) the pick from the block's shared state (pick_block leaves it in f.cnt for every thread), not from *prev:
+    // only thread 0 writes *prev, and through the __restrict__ pointer nvcc 12.6 for sm_70 loads it for the other threads
+    // BEFORE the barrier above (their value was the previous draft's pick, seen in the SASS): the w1 row of the pick was
+    // then looked for under another token (inkling2_dspark_parity on a V100: "the pick's w1 row copied out" FAIL, the
+    // row of draft 3 left in place after drafts 4 to 6). The same value as *out_id: bi, or 0 for no row.
+    const int pick = f.cnt < 0x7fffffff ? f.cnt : 0;
     if (tid == 0) ids[i] = pick;
     for (int c = warp; c < n; c += 16)
         if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_row)[lane] = wr[c][lane];
@@ -720,4 +725,20 @@ void dspark_split_rnn(const uint16_t* w, uint16_t* w_sp, uint16_t* w_h, uint16_t
     check("split");
 }
 
+
+// (Lapilli) the SwiGLU of the block's gate and up rows on a V100 (the window gemm's epilogue formula)
+namespace {
+__global__ void swiglu_v70_kernel(const float* __restrict__ g, const float* __restrict__ u, float* h, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float gv = g[i];
+    h[i] = gv / (1.0f + expf(-gv)) * u[i];
+}
+}  // namespace
+
+void dspark_swiglu_v70(const float* g, const float* u, float* h, int64_t n, void* stream) {
+    if (n <= 0) return;
+    swiglu_v70_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(g, u, h, n);
+    check("swiglu (V100)");
+}
 }  // namespace basalt::models::inkling2

@@ -40,6 +40,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -85,6 +86,37 @@ struct Scratch {
     static constexpr int kGuessExperts = 8;     // the experts a window's guess requests a visit (rows x kGuessExperts / rows)
     static constexpr int kGuessRows = 2;        // the widest window guessed (wider ones keep the read-ahead)
 };
+
+// (Lapilli, V100) The experts' weights read into L2 ahead of their kernel: the guess of windows of one or two rows (the
+// next visit's router on a side stream, then a read of the guessed experts' gate and up weights) and the read-ahead of
+// wider windows (an L2 bulk prefetch, compiled out below sm_90: only its last 16 bytes a step are read). Both pay on a card
+// whose L2 holds a visit's experts. On a V100 (6 MB of L2; a visit's guessed weights up to 24 MB) the guess's reads only
+// compete with the visit's own (a window of one row 13.2 -> 11.4 ms without it, two rows 15.7 -> 14.5, the wider
+// ones alike): both are off below 32 MB of L2. BASALT_INK_GUESS=0/1 and BASALT_INK_READ_AHEAD=0/1 force them. The bits do
+// not depend on them (they only warm the cache).
+inline bool small_l2() {
+    static const bool small = [] {
+        int dev = 0, l2 = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return l2 < (32 << 20);
+    }();
+    return small;
+}
+inline bool forced(const char* name, bool dflt) {
+    const char* e = std::getenv(name);
+    return e != nullptr && (e[0] == '0' || e[0] == '1') && e[1] == 0 ? e[0] == '1' : dflt;
+}
+inline bool guess_on() {
+    static const bool on = forced("BASALT_INK_GUESS", !small_l2());
+    return on;
+}
+inline bool read_ahead_on() {
+    static const bool on = forced("BASALT_INK_READ_AHEAD", !small_l2());
+    return on;
+}
 
 // What the sessions of one model share: the forward scratch (with the layer split, the second card's too), the prompt path,
 // the drafter's tap, the CPU experts and the batch windows' graphs. Made by the first session; the model keeps a weak
@@ -748,10 +780,22 @@ public:
     }
     std::string info_words() const override {
         const std::string n = std::to_string(expert_pairs() - m_.spill().spilled);
-        uint64_t ram = 0;
-        for (int l = 0; l < g_.n_layers; ++l) ram += (uint64_t) m_.layer(l).n_spill * m_.layer(l).expert_stride;
+        uint64_t ram = 0, card = 0;
+        int64_t spilled = 0;
+        for (int l = 0; l < g_.n_layers; ++l) {
+            ram += (uint64_t) m_.layer(l).n_spill * m_.layer(l).expert_stride;
+            card += (uint64_t) (g_.n_expert - m_.layer(l).n_spill) * m_.layer(l).expert_stride;
+            spilled += m_.layer(l).n_spill;
+        }
+        // (Lapilli) the page's expert tiers, as the deepseek41 engine words them (core::ExpertTier::occupancy_words): per layer
+        // (the mean of a spilled layer's count) and the tier's MiB over every layer (the Q8_0 layers' experts are larger)
+        const int64_t ram_per_layer = g_.n_layers > 0 ? spilled / g_.n_layers : 0;
+        const std::string tiers = " expert_cache_mib=" + std::to_string(card >> 20) + " expert_tiers=main/" +
+                                  std::to_string(g_.n_expert - ram_per_layer) + "/" + std::to_string(card >> 20) + ",peer/0/0,ram/" +
+                                  std::to_string(ram_per_layer) + "/" + std::to_string(ram >> 20) + ",file/0/0 expert_layers=" +
+                                  std::to_string(g_.n_layers) + " experts_per_layer=" + std::to_string(g_.n_expert) + " main_copies=0";
         return "expert_slots=" + n + " expert_slots_primary=" + n + " ram_experts_mib=" + std::to_string(ram >> 20) + (m_.cache_fp8() ? " kv=fp8 " : " kv=fp16 ") +
-               program::spill_words({0, expert_pairs(), 0});
+               program::spill_words({0, expert_pairs(), 0}) + tiers;
     }
 
 private:
@@ -866,7 +910,7 @@ private:
         // kGuessExperts / rows best) into L2 on the other side stream, while the attention and the glue before the experts
         // run (it starts once the projections are done)
         const int vi = (int) (&v - g_.visits.data());
-        const bool guess = rows <= kGuessRows;
+        const bool guess = rows <= kGuessRows && guess_on();
         if (guess && vi > 0 && m_.card_of(g_.visits[(size_t) vi - 1].layer) == card) {   // its guess was made on this card
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(k.pf_ev, k.stream);
@@ -919,7 +963,7 @@ private:
         bk::native_q8_planes_mmvq(w.out, x.xo_, x.o_, kOutRows, E, rows, k.stream);
         // a wider window: the experts this visit took in the window before into L2 on the side stream, while the glue
         // before the experts runs (it starts once the output projection is done)
-        if (!guess) {
+        if (!guess && read_ahead_on()) {
             const bk::NativeExpertLayout Lx = bk::native_expert_layout(w.gu_type, w.d_type, E, g_.n_ff_exp);
             cudaEventRecord(k.ra_ev, k.stream);
             cudaStreamWaitEvent(k.ra_st, k.ra_ev, 0);

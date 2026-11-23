@@ -6,6 +6,7 @@
 // K=32 sub-blocks, execute mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32, and accumulate scaled int32 block dots
 // in deterministic K order. 35 KiB shared memory per CTA lets two CTAs occupy each sm_120 SM concurrently.
 #include "basalt/prefill/q8_gemm.hpp"
+#include "basalt/kernels/volta_sm100.hpp"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -64,42 +65,42 @@ struct Args {
 
 __device__ __forceinline__ unsigned su(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3, unsigned a) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+    BASALT_SM100_ASM("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
 }
 __device__ __forceinline__ void ldsm2(unsigned& r0, unsigned& r1, unsigned a) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+    BASALT_SM100_ASM("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1) : "r"(a));
 }
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1, unsigned a2,
                                        unsigned a3, unsigned b0, unsigned b1) {
     int z = 0;
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+    BASALT_SM100_ASM("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
                  : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z), "r"(z), "r"(z), "r"(z));
 }
 __device__ __forceinline__ void mb_init(unsigned long long* b, unsigned n) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(su(b)), "r"(n) : "memory");
+    BASALT_SM100_ASM("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(su(b)), "r"(n) : "memory");
 }
 __device__ __forceinline__ void mb_wait(unsigned long long* b, unsigned phase) {
-    asm volatile("{\n.reg .pred d;\nw_%=:\nmbarrier.try_wait.parity.shared::cta.b64 d, [%0], %1, %2;\n@d bra e_%=;\nbra w_%=;\ne_%=:\n}\n"
+    BASALT_SM100_ASM("{\n.reg .pred d;\nw_%=:\nmbarrier.try_wait.parity.shared::cta.b64 d, [%0], %1, %2;\n@d bra e_%=;\nbra w_%=;\ne_%=:\n}\n"
                  ::"r"(su(b)), "r"(phase), "r"(0x989680u) : "memory");
 }
 __device__ __forceinline__ void mb_arrive(unsigned long long* b) {
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(su(b)) : "memory");
+    BASALT_SM100_ASM("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(su(b)) : "memory");
 }
 __device__ __forceinline__ void mb_expect(unsigned long long* b, unsigned bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(su(b)), "r"(bytes) : "memory");
+    BASALT_SM100_ASM("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(su(b)), "r"(bytes) : "memory");
 }
 __device__ __forceinline__ void cp_mb_arrive(unsigned long long* b) {
-    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(su(b)) : "memory");
+    BASALT_SM100_ASM("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(su(b)) : "memory");
 }
 __device__ __forceinline__ void cp16(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(su(dst)), "l"(src) : "memory");
+    BASALT_SM100_ASM("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(su(dst)), "l"(src) : "memory");
 }
 __device__ __forceinline__ void tma2d(void* dst, const TmaDesc* m, int k, int r, unsigned long long* b) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+    BASALT_SM100_ASM("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                  ::"r"(su(dst)), "l"(m), "r"(k), "r"(r), "r"(su(b)) : "memory");
 }
 __device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
@@ -233,7 +234,7 @@ __global__ __launch_bounds__(NT, 2) void gemm_kernel(const __grid_constant__ Arg
                 }
             }
         }
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        BASALT_SM100_ASM("fence.proxy.async.shared::cta;" ::: "memory");
         __syncwarp();
         if (lane == 0) mb_arrive(empty + st);
     };
@@ -337,6 +338,76 @@ void tmap(TmaDesc* out, const void* base, int64_t rows, int64_t cols, int box_ro
     std::memcpy(out, &m, sizeof m);
 }
 
+// ---------------------------------------------------------------- (Lapilli) the V100: dp4a, the same arithmetic
+// Volta has neither TMA nor int8 tensor cores: a block takes 64 weight rows x 16 tokens, one K=32 block at a time through
+// shared memory, each thread 4 tokens of one row. A block's integer dot is exact (dp4a, as the mma's), then
+// acc = fmaf(dot, a_scale * w_scale, acc) in K order, as gemm_kernel: the same bits, at any chunk length.
+constexpr int V70_ROWS = 64, V70_TOK = 16, V70_THREADS = 256;
+__global__ void __launch_bounds__(V70_THREADS) gemm_v70_kernel(const int8_t* __restrict__ w, const __half* __restrict__ w_sc,
+                                                              int w_sc_ld, int w_rows, const int8_t* __restrict__ a,
+                                                              const float* __restrict__ a_sc, int a_sc_ld, int ntok,
+                                                              int k_cols, float* __restrict__ dst, int64_t ld, int epi) {
+    __shared__ int ws[V70_ROWS][9];   // a K block's 32 codes of each row (8 words), padded: no bank conflict
+    __shared__ int xs[V70_TOK][8];
+    __shared__ float wsc[V70_ROWS], asc[V70_TOK];
+    const int t = (int) threadIdx.x, n = t & (V70_ROWS - 1), tq = t >> 6;   // row n, tokens 4 tq .. 4 tq + 3
+    const int row0 = (int) blockIdx.x * V70_ROWS, tok0 = (int) blockIdx.y * V70_TOK;
+    const int nb = k_cols >> 5;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int kb = 0; kb < nb; ++kb) {
+        for (int i = t; i < V70_ROWS * 8; i += V70_THREADS) {
+            const int r = i >> 3, c = i & 7;
+            ws[r][c] = row0 + r < w_rows ? *reinterpret_cast<const int*>(w + (size_t) (row0 + r) * k_cols + kb * 32 + c * 4) : 0;
+        }
+        if (t < V70_TOK * 8) {
+            const int r = t >> 3, c = t & 7;
+            xs[r][c] = tok0 + r < ntok ? *reinterpret_cast<const int*>(a + (size_t) (tok0 + r) * k_cols + kb * 32 + c * 4) : 0;
+        }
+        // the scale planes are padded to 64 rows and 64 tokens (scale_plane_ld, act_scale_ld): these reads stay inside
+        if (t < V70_ROWS) wsc[t] = __half2float(w_sc[(size_t) kb * w_sc_ld + row0 + t]);
+        else if (t < V70_ROWS + V70_TOK) asc[t - V70_ROWS] = a_sc[(size_t) kb * a_sc_ld + tok0 + (t - V70_ROWS)];
+        __syncthreads();
+        const float sw = wsc[n];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r = 4 * tq + i;
+            int dot = 0;
+#pragma unroll
+            for (int c = 0; c < 8; ++c) dot = __dp4a(ws[n][c], xs[r][c], dot);
+            acc[i] = fmaf((float) dot, asc[r] * sw, acc[i]);
+        }
+        __syncthreads();
+    }
+    const int row = row0 + n;
+    if (row >= w_rows) return;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int tk = tok0 + 4 * tq + i;
+        if (tk >= ntok) continue;
+        float* d = dst + (int64_t) tk * ld + row;
+        *d = epi == (int) Epilogue::Add ? *d + acc[i] : acc[i];
+    }
+}
+
+// (Lapilli) compute capability below 8.0 (the V100): no TMA, no int8 tensor cores; read once per device
+bool volta_card() {
+    static std::atomic<int> major_of[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return false;
+    }
+    int m = major_of[dev].load(std::memory_order_acquire);
+    if (m == 0) {
+        if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess || m <= 0) {
+            cudaGetLastError();
+            return false;
+        }
+        major_of[dev].store(m, std::memory_order_release);
+    }
+    return m < 8;
+}
+
 }  // namespace
 
 size_t act_bytes(int64_t rows, int64_t cols) {
@@ -384,6 +455,24 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
     if (nseg > MAX_SEG || w_cols % 64 != 0) {
         basalt::log::error("basalt", "prefill q8: %d segments of %lld columns", nseg, (long long) w_cols);
         std::exit(1);
+    }
+    if (volta_card()) {   // (Lapilli) a V100: gemm_v70_kernel, one launch a segment (each the bits of its gemm alone)
+        const float* a_sc = reinterpret_cast<const float*>(static_cast<const uint8_t*>(act) + scale_off(rows, w_cols));
+        for (int i = 0; i < nseg; ++i) {
+            const Segment& s = seg[i];
+            if (s.rows <= 0 || !s.w_scales_t || ((uintptr_t) s.w & 3) != 0 || s.ld_dst < s.rows) {
+                basalt::log::error("basalt", "prefill q8 (V100): segment %d: [%lld x %lld] matrix, ld %lld", i,
+                                   (long long) s.rows, (long long) w_cols, (long long) s.ld_dst);
+                std::exit(1);
+            }
+            const dim3 grid((unsigned) ((s.rows + V70_ROWS - 1) / V70_ROWS), (unsigned) ((rows + V70_TOK - 1) / V70_TOK));
+            gemm_v70_kernel<<<grid, V70_THREADS, 0, (cudaStream_t) stream>>>(
+                s.w, reinterpret_cast<const __half*>(s.w_scales_t), (int) scale_plane_ld(s.rows), (int) s.rows,
+                static_cast<const int8_t*>(act), a_sc, (int) act_scale_ld(rows), (int) rows, (int) w_cols, s.dst, s.ld_dst,
+                (int) epi);
+        }
+        ck("gemm (V100)");
+        return;
     }
     static std::atomic<bool> configured[64];
     int dev = 0;

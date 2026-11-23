@@ -130,6 +130,9 @@ int opt_in_device();
 
 /// Bytes of scratch attention_decode needs for `rows` rows over at most `max_keys` keys.
 size_t attention_decode_scratch(int rows, int64_t max_keys);
+/// (Lapilli, for the parity test) a window's rows of a full visit: 1 = attn_split_kernel for every row, 2 = attn_rows_kernel
+/// (the same bits), 0 = as BASALT_INK_ATTN_ROWS says (unset: attn_rows_kernel).
+void attention_rows_mode(int mode);
 /// out[r][h] = sum_j softmax_j(scale q.k_j + bias(pos_r - pos_j)) v_j over the keys at positions <= pos_r (and within the
 /// window), with exp(sink[r][h]) beside them in the softmax's denominator. `max_keys` bounds the keys any row reads (it
 /// sizes the launch only: a row's keys split in slices fixed by its own key count). `out` may be null when q8 is set.

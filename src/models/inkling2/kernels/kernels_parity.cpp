@@ -452,6 +452,177 @@ void test_attention() {
     }
 }
 
+// (Lapilli, V100) attn_rows_kernel: a decode window's rows of a full visit share each tile's loads. Against each row alone
+// (attn_split_kernel): the fp32 output and the gated q8_1 blocks bitwise, for windows of 2 to 8 rows at a short context,
+// mid-tile, across a slice-size step (every 8192 keys: two classes of rows in one block) and at 64K keys, fp16 and E4M3
+// caches; a row's bits under a larger launch bound; then a window's time at 64K keys against its rows one by one.
+void test_attention_rows() {
+    struct Case { int p0, R; };
+    const Case cases[] = {{3, 2}, {40, 5}, {2995, 4}, {8189, 4}, {8190, 8}, {16380, 6}, {65530, 8}, {65532, 4}};
+    uint64_t x = 0x9E3779B97F4A7C15ull;
+    const auto next = [&x] {   // xorshift64*: the caches of 64K keys are 67M values a side
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        return x * 0x2545F4914F6CDD1Dull;
+    };
+    for (int fp8 = 0; fp8 < 2; ++fp8)
+        for (const Case& c : cases) {
+            const int R = c.R, p0 = c.p0;
+            const int64_t cap = p0 + R + 1;
+            const size_t cells = (size_t) cap * kKvHeads * kHeadDim;
+            // finite values of 2^-4 .. 4 with a random sign: fp16 codes, or E4M3 codes (exponent 3..8, never NaN)
+            void *dk = nullptr, *dv = nullptr;
+            if (fp8) {
+                std::vector<uint8_t> k8(cells), v8(cells);
+                for (size_t i = 0; i < cells; ++i) {
+                    const uint64_t r = next();
+                    k8[i] = (uint8_t) (((r & 1) << 7) | ((3 + (r >> 1) % 6) << 3) | ((r >> 8) & 7));
+                    v8[i] = (uint8_t) ((((r >> 16) & 1) << 7) | ((3 + (r >> 17) % 6) << 3) | ((r >> 24) & 7));
+                }
+                dk = dev(k8);
+                dv = dev(v8);
+            } else {
+                std::vector<uint16_t> kh(cells), vh(cells);
+                for (size_t i = 0; i < cells; ++i) {
+                    const uint64_t r = next();
+                    kh[i] = (uint16_t) (((r & 1) << 15) | ((11 + (r >> 1) % 6) << 10) | ((r >> 8) & 1023));
+                    vh[i] = (uint16_t) ((((r >> 20) & 1) << 15) | ((11 + (r >> 21) % 6) << 10) | ((r >> 28) & 1023));
+                }
+                dk = dev(kh);
+                dv = dev(vh);
+            }
+            std::vector<int> pos(R);
+            for (int r = 0; r < R; ++r) pos[r] = p0 + r;
+            const std::vector<float> q = randn((size_t) R * kHeads * kHeadDim, 0.3f), rs = randn((size_t) R * kHeads * kRel, 1.0f);
+            const std::vector<float> sink = randn((size_t) R * kHeads, 2.0f), table = randn((size_t) kRel * kExtent, 0.3f);
+            const std::vector<float> gate = randn((size_t) R * kProjQ, 1.5f);
+            float *dq = dev(q), *drs = dev(rs), *dsink = dev(sink), *dt = dev(table), *dgate = dev(gate);
+            int* dpos = dev(pos);
+            const size_t row_f = (size_t) kHeads * kHeadDim, row_b = row_f / 32 * 36;
+            AttnArgs a;
+            a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap;
+            a.fp8 = fp8 != 0;
+            a.window = 0;
+            a.gate = dgate + kOffGate;
+            a.gate_ld = kProjQ;
+            a.q8 = zeros<uint8_t>(R * row_b);
+            const int64_t max_keys = p0 + R;
+            void* scr = zeros<uint8_t>(attention_decode_scratch(R, 1 << 20));
+            float* out = zeros<float>(R * row_f);
+            attention_decode(a, R, max_keys, scr, out, nullptr);
+            const std::vector<float> got = host(out, R * row_f);
+            const std::vector<uint8_t> got8 = host(static_cast<const uint8_t*>(a.q8), R * row_b);
+            // each row alone
+            std::vector<float> alone(R * row_f);
+            std::vector<uint8_t> alone8(R * row_b);
+            float* out1 = zeros<float>(row_f);
+            AttnArgs one = a;
+            one.q8 = zeros<uint8_t>(row_b);
+            for (int r = 0; r < R; ++r) {
+                one.q = dq + (size_t) r * row_f;
+                one.r = drs + (size_t) r * kHeads * kRel;
+                one.sink = dsink + (size_t) r * kHeads;
+                one.pos = dpos + r;
+                one.gate = dgate + (size_t) r * kProjQ + kOffGate;
+                attention_decode(one, 1, max_keys, scr, out1, nullptr);
+                cudaMemcpy(&alone[r * row_f], out1, row_f * 4, cudaMemcpyDeviceToHost);
+                cudaMemcpy(&alone8[r * row_b], one.q8, row_b, cudaMemcpyDeviceToHost);
+            }
+            bool finite = true;
+            for (float v : got) finite = finite && std::isfinite(v);
+            char tag[96];
+            std::snprintf(tag, sizeof tag, "attention rows (%s, %d rows at %d)", fp8 ? "E4M3" : "fp16", R, p0);
+            same_bits(tag, alone.data(), got.data(), got.size() * 4);
+            same_bits("  its q8_1 blocks", alone8.data(), got8.data(), got8.size());
+            if (!finite) {
+                std::printf("  FAIL: a value is not finite\n");
+                ++failures;
+            }
+            if (c.p0 == 8190) {   // a launch bound of a million keys: more slices launched, the same bits
+                float* outb = zeros<float>(R * row_f);
+                attention_decode(a, R, 1 << 20, scr, outb, nullptr);
+                const std::vector<float> gb = host(outb, R * row_f);
+                same_bits("  any launch bound", gb.data(), got.data(), gb.size() * 4);
+                cudaFree(outb);
+            }
+            if (p0 >= 65530) {
+                attention_rows_mode(1);   // attn_split_kernel for every row, in one launch (its rows' blocks side by side)
+                const double us_split = time_us([&] { attention_decode(a, R, max_keys, scr, out, nullptr); }, 20);
+                attention_rows_mode(0);
+                const double us = time_us([&] { attention_decode(a, R, max_keys, scr, out, nullptr); }, 20);
+                const double us1 = time_us([&] {
+                    for (int r = 0; r < R; ++r) {
+                        one.q = dq + (size_t) r * row_f; one.r = drs + (size_t) r * kHeads * kRel; one.sink = dsink + (size_t) r * kHeads;
+                        one.pos = dpos + r; one.gate = dgate + (size_t) r * kProjQ + kOffGate;
+                        attention_decode(one, 1, max_keys, scr, out1, nullptr);
+                    }
+                }, 20);
+                const double bytes = (double) max_keys * kKvHeads * kHeadDim * (fp8 ? 1 : 2) * 2;
+                std::printf("  %.1f us the window (%.0f GB/s of K and V read once); attn_split_kernel %.1f us in one launch, %.1f us"
+                            " its rows one by one\n", us, bytes / us / 1e3, us_split, us1);
+            }
+            cudaFree(dk); cudaFree(dv); cudaFree(dq); cudaFree(drs); cudaFree(dsink); cudaFree(dt); cudaFree(dgate); cudaFree(dpos);
+            cudaFree(a.q8); cudaFree(one.q8); cudaFree(scr); cudaFree(out); cudaFree(out1);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) {
+                std::printf("  FAIL: %s\n", cudaGetErrorString(e));
+                ++failures;
+            }
+        }
+}
+
+// (Lapilli, V100) the drafter's V100 products (native_q8_0_mmvq over Q8_0 blocks, 8 columns) against the same weights in
+// planes (native_q8_planes_mmvq: int8 codes [rows][K], then fp16 scales [rows][K/32]): bitwise for 1 to 8 columns at the
+// drafter's shapes, then each one's time at 8 columns.
+void test_q8_blocks_vs_planes() {
+    cudaStream_t st = nullptr;   // the native products want a stream of their own
+    cudaStreamCreate(&st);
+    struct Sh { const char* name; int M, K; };
+    const Sh shs[] = {{"q [3072 x 2304]", 3072, 2304}, {"k, v [1024 x 2304]", 1024, 2304}, {"o [2304 x 3072]", 2304, 3072},
+                      {"gate, up [6144 x 2304]", 6144, 2304}, {"down [2304 x 6144]", 2304, 6144}};
+    std::uniform_int_distribution<int> code(-127, 127);
+    for (const Sh& sh : shs) {
+        const size_t nb = (size_t) sh.M * (sh.K / 32);
+        std::vector<uint8_t> blocks(nb * 34), planes((size_t) sh.M * sh.K + nb * 2);
+        const std::vector<float> sf = randn(nb, 0.01f);
+        for (size_t b = 0; b < nb; ++b) {   // block b = row b / (K/32), block b % (K/32): d, then 32 codes
+            const uint16_t d = f2h(std::fabs(sf[b]) + 1e-4f);
+            std::memcpy(&blocks[b * 34], &d, 2);
+            std::memcpy(&planes[(size_t) sh.M * sh.K + b * 2], &d, 2);
+            for (int j = 0; j < 32; ++j) {
+                const int8_t q = (int8_t) code(rng);
+                blocks[b * 34 + 2 + j] = (uint8_t) q;
+                planes[b * 32 + j] = (uint8_t) q;
+            }
+        }
+        uint8_t *dbl = dev(blocks), *dpl = dev(planes);
+        const std::vector<float> xf = randn((size_t) 8 * sh.K, 1.0f);
+        float* dx = dev(xf);
+        void* xq = zeros<uint8_t>(bk::native_q8_1_bytes(sh.K, 8));
+        bk::native_quantize_q8_1(dx, xq, sh.K, 8, st);
+        float *y0 = zeros<float>((size_t) 8 * sh.M), *y1 = zeros<float>((size_t) 8 * sh.M);
+        bool ok = true;
+        for (int T = 1; T <= 8; ++T) {
+            bk::native_q8_0_mmvq(dbl, xq, y0, sh.K, sh.M, T, st);
+            bk::native_q8_planes_mmvq(dpl, xq, y1, sh.K, sh.M, T, st);
+            cudaStreamSynchronize(st);
+            const std::vector<float> a = host(y0, (size_t) T * sh.M), b = host(y1, (size_t) T * sh.M);
+            ok = ok && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+        }
+        char tag[96];
+        std::snprintf(tag, sizeof tag, "q8 blocks = planes %s", sh.name);
+        std::printf("%-34s %s\n", tag, ok ? "bitwise" : "FAIL");
+        failures += !ok;
+        const double mb = (double) (nb * 34) / 1e6;
+        const double u0 = time_us([&] { bk::native_q8_0_mmvq(dbl, xq, y0, sh.K, sh.M, 8, st); });
+        const double u1 = time_us([&] { bk::native_q8_planes_mmvq(dpl, xq, y1, sh.K, sh.M, 8, st); });
+        std::printf("  8 columns: blocks %.1f us (%.0f GB/s), planes %.1f us (%.0f GB/s)\n", u0, mb / u0 * 1e3, u1, mb / u1 * 1e3);
+        cudaFree(dbl); cudaFree(dpl); cudaFree(dx); cudaFree(xq); cudaFree(y0); cudaFree(y1);
+    }
+    cudaStreamDestroy(st);
+}
+
 // ---- post-sublayer convolutions ----------------------------------------------------------------------------------------
 
 void test_post_conv() {
@@ -577,6 +748,121 @@ void test_experts() {
     }
     std::printf("%-34s %s\n", "  the experts' tally", tally_ok ? "counted" : "FAIL");
     failures += !tally_ok;
+}
+
+// (Lapilli, V100) the experts' kernels compiled for 1 to 4 blocks per SM (native_grouped_set_minb: launch bounds only):
+// the entries' outputs bitwise against 1 block, for windows of 1 and 4 rows (8 experts a row among 32), NVFP4 and Q8_0
+// experts at Inkling's 2304 x 1152; then the time of gate/up, SwiGLU and down at each bound, gate/up's then down's.
+void test_experts_minb() {
+    const int H = E, FF = 1152, NE = 32, K = 8;
+    uint64_t x = 0xD1B54A32D192ED03ull;
+    const auto next = [&x] {
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        return x * 0x2545F4914F6CDD1Dull;
+    };
+    cudaStream_t st;
+    cudaStreamCreate(&st);
+    for (const int ty : {40, 8}) {
+        bk::NativeExpertLayout L = bk::native_expert_layout(ty, ty, H, FF);
+        L.gate_softcap = 4.f;
+        L.up_softcap = 25.f;
+        std::vector<uint8_t> blobs((size_t) NE * L.bytes);
+        // random codes, scales kept small and finite: NVFP4 blocks of 36 bytes (4 E4M3 scales of exponent 1..7, then 32
+        // code bytes), Q8_0 blocks of 34 (an fp16 scale, then 32 codes); a row is whole blocks
+        const auto fill_rows = [&](uint8_t* p, int rows, size_t row_bytes) {
+            const int bsz = ty == 40 ? 36 : 34;
+            for (int r = 0; r < rows; ++r)
+                for (size_t b = 0; b < row_bytes / bsz; ++b) {
+                    uint8_t* q = p + (size_t) r * row_bytes + b * bsz;
+                    const uint64_t v = next();
+                    if (ty == 40) {
+                        for (int i = 0; i < 4; ++i) q[i] = (uint8_t) ((((v >> (8 * i)) % 7) + 1) << 3 | ((v >> (8 * i + 4)) & 7));
+                        for (int i = 4; i < 36; ++i) q[i] = (uint8_t) (next() >> 24);
+                    } else {
+                        const uint16_t d = f2h(0.002f + 0.004f * (float) (v % 1000) / 1000.f);
+                        std::memcpy(q, &d, 2);
+                        for (int i = 2; i < 34; ++i) q[i] = (uint8_t) (next() >> 24);
+                    }
+                }
+        };
+        for (int e = 0; e < NE; ++e) {
+            uint8_t* b = blobs.data() + (size_t) e * L.bytes;
+            fill_rows(b, FF, L.gu_row);
+            fill_rows(b + L.up_off, FF, L.gu_row);
+            fill_rows(b + L.down_off, H, L.d_row);
+            if (ty == 40) {
+                const float tail[4] = {0.5f, 0.5f, 0.5f, 0.f};
+                std::memcpy(b + L.bytes - 16, tail, 16);
+            }
+        }
+        uint8_t* dblobs = dev(blobs);
+        std::vector<unsigned long long> table(NE);
+        for (int e = 0; e < NE; ++e) table[(size_t) e] = (unsigned long long) (dblobs + (size_t) e * L.bytes);
+        unsigned long long* dtable = dev(table);
+        for (const int R : {1, 4}) {
+            std::vector<int32_t> ids((size_t) R * K);
+            for (int r = 0; r < R; ++r)
+                for (int k = 0; k < K; ++k) {   // K distinct experts a row
+                    int e;
+                    bool dup;
+                    do {
+                        e = (int) (next() % NE);
+                        dup = false;
+                        for (int j = 0; j < k; ++j) dup |= ids[(size_t) r * K + j] == e;
+                    } while (dup);
+                    ids[(size_t) r * K + k] = e;
+                }
+            const std::vector<float> xs = randn((size_t) R * H, 1.0f);
+            int32_t *dids = dev(ids), *start = zeros<int32_t>(R * K + 2), *ng = zeros<int32_t>(4), *dst = zeros<int32_t>(R * K),
+                    *tok = zeros<int32_t>(R * K);
+            unsigned long long* ptr = zeros<unsigned long long>(R * K);
+            float *dx = dev(xs), *rows0 = zeros<float>((size_t) R * K * H), *rows1 = zeros<float>((size_t) R * K * H);
+            void* xq = zeros<uint8_t>(bk::native_q8_1_bytes(H, R));
+            void* scr = zeros<uint8_t>(bk::native_expert_scratch_bytes(R * K, FF));
+            moe_plan(dids, R, K, NE, dtable, ptr, start, ng, dst, tok, st);
+            bk::native_quantize_q8_1(dx, xq, H, R, st);
+            const auto run = [&](float* rows) { bk::native_expert_grouped(L, ptr, start, ng, dst, tok, NE, R * K, xq, scr, rows, st); };
+            bk::native_grouped_set_minb(1, 0);   // the original bounds of both
+            run(rows0);
+            cudaStreamSynchronize(st);
+            const std::vector<float> a = host(rows0, (size_t) R * K * H);
+            bool same = true, finite = true;
+            for (float v : a) finite = finite && std::isfinite(v);
+            char line[256];
+            int at = std::snprintf(line, sizeof line, "  %s %d rows, us: 1,0 %.1f", ty == 40 ? "NVFP4" : "Q8_0", R,
+                                   time_us([&] { run(rows1); }));
+            for (const int g : {2, 3, 4}) {   // gate/up's bound, down's original
+                bk::native_grouped_set_minb(g, 0);
+                run(rows1);
+                cudaStreamSynchronize(st);
+                same = same && std::memcmp(a.data(), host(rows1, a.size()).data(), a.size() * 4) == 0;
+                at += std::snprintf(line + at, sizeof line - (size_t) at, " | %d,0 %.1f", g, time_us([&] { run(rows1); }));
+            }
+            for (const int d : {1, 2, 3, 4}) {   // down's bound, gate/up's original
+                bk::native_grouped_set_minb(1, d);
+                run(rows1);
+                cudaStreamSynchronize(st);
+                same = same && std::memcmp(a.data(), host(rows1, a.size()).data(), a.size() * 4) == 0;
+                at += std::snprintf(line + at, sizeof line - (size_t) at, " | 1,%d %.1f", d, time_us([&] { run(rows1); }));
+            }
+            char tag[96];
+            std::snprintf(tag, sizeof tag, "experts minb (%s, %d rows)", ty == 40 ? "NVFP4" : "Q8_0", R);
+            std::printf("%-34s %s\n%s\n", tag, same && finite ? "bitwise" : "FAIL", line);
+            failures += !(same && finite);
+            bk::native_grouped_set_minb(0, 0);
+            cudaFree(dids); cudaFree(start); cudaFree(ng); cudaFree(dst); cudaFree(tok); cudaFree(ptr); cudaFree(dx);
+            cudaFree(rows0); cudaFree(rows1); cudaFree(xq); cudaFree(scr);
+        }
+        cudaFree(dblobs); cudaFree(dtable);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::printf("  FAIL: %s\n", cudaGetErrorString(err));
+            ++failures;
+        }
+    }
+    cudaStreamDestroy(st);
 }
 
 void test_softcap() {
@@ -1267,8 +1553,11 @@ int main() {
     test_ctrl();
     test_prepare();
     test_attention();
+    test_attention_rows();
+    test_q8_blocks_vs_planes();
     test_post_conv();
     test_experts();
+    test_experts_minb();
     test_softcap();
     test_mix_norm();
     test_controllers();

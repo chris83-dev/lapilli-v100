@@ -111,7 +111,7 @@ const Moniteur = (() => {
     const ticks = [0, max / 2, max];
     const etiquettes = ticks.map((t) => (o.fmtTic || tic)(t));
     const g = Math.max(...etiquettes.map((e) => e.length)) * 6.6 + 10;
-    const x0 = Math.round(g), x1 = W - 4, y0 = 6, y1 = H - 20;
+    const x0 = Math.round(g), x1 = W - 4, y0 = 6, y1 = H - (o.bande || 20);   // o.bande, o.basTexte: a neighbour's bottom rows
     const X = (i) => (n <= 1 ? x1 : x0 + ((x1 - x0) * i) / (n - 1));
     const Y = (v) => y1 - ((y1 - y0) * Math.min(v, max)) / max;
     ticks.forEach((t, k) => {
@@ -119,8 +119,8 @@ const Moniteur = (() => {
       svg("line", {x1: x0, x2: x1, y1: y, y2: y, class: k ? "grille" : "base"}, s);
       svg("text", {x: x0 - 8, y: y + 4, "text-anchor": "end", class: "tic"}, s).textContent = etiquettes[k];
     });
-    svg("text", {x: x0, y: H - 4, class: "tic"}, s).textContent = `${nf(n)} s ago`;
-    svg("text", {x: x1, y: H - 4, "text-anchor": "end", class: "tic"}, s).textContent = "now";
+    svg("text", {x: x0, y: H - (o.basTexte || 4), class: "tic"}, s).textContent = `${nf(n)} s ago`;
+    svg("text", {x: x1, y: H - (o.basTexte || 4), "text-anchor": "end", class: "tic"}, s).textContent = "now";
     if (n >= 2) {
       const bas = new Array(n).fill(0);
       for (const x of o.series) {
@@ -591,8 +591,8 @@ const Moniteur = (() => {
           <div class="creneau__bloc"><div class="ligne-barre"><span>Tokens per window</span><span class="doux" id="cr-dl-t-${i}"></span></div>
             <div class="graphe graphe--petit" id="cr-dl-${i}"></div></div>
           <div class="creneau__bloc"><div class="ligne-barre"><span>Its experts</span><span class="doux" id="cr-ex-t-${i}"></span></div>
-            <div class="repartition" id="cr-ex-${i}" aria-hidden="true"></div>
-            <div class="repartition-legende" id="cr-ex-l-${i}"></div></div>
+            <div class="creneau__zone"><div class="repartition" id="cr-ex-${i}" aria-hidden="true"></div>
+            <div class="repartition-legende" id="cr-ex-l-${i}"></div></div></div>
         </div>`).join("");
     }
     // /slots and /metrics are read one after the other: at the end of a response the slots may still say "decoding" while
@@ -636,7 +636,7 @@ const Moniteur = (() => {
       const dl = (s.accept_hist || []).filter((v) => v != null);
       $(`cr-dl-t-${i}`).textContent = s.draft_len != null ? `${nf(s.draft_len, 2)} on average` : dl.length ? `${nf(dl.reduce((a, v) => a + v, 0) / dl.length, 2)} on average` : "–";
       graphe($(`cr-dl-${i}`), {titre: "Tokens written per verify window, by second", series: [{nom: "Tokens per window", c: C.ecriture, v: s.accept_hist || []}],
-        hauteur: 72, plancher: 2, unite: "tokens"});
+        hauteur: 92, bande: 22, basTexte: 5, plancher: 2, unite: "tokens"});   // the drafts' columns beside it: 92 px, base 70, labels 87
       const hh = s.hit;
       const parts = hh ? [["GPU 0", C.gpu0, hh.vram], ["GPU 1 or PCIe", C.gpu1, hh.peer], ["CPU", C.ram, hh.cpu]] : null;
       $(`cr-ex-${i}`).innerHTML = parts ? partsBarre(parts) : "";
@@ -928,9 +928,13 @@ const Moniteur = (() => {
       $("ex-note").textContent = "Activity: how many lookups each expert had in the last seconds, wherever it is kept. Hover an expert for its figures.";
     } else {
       $("ex-legende").innerHTML = MAISONS.map((mm, k) => (ex.homes[k] > 0 || k < 3 ? `<span class="cle" style="--c:${mm[1]}">${k === 2 ? (copiesPcie() ? "RAM (the CPU, or GPU 0 over PCIe)" : "RAM (the CPU computes it)") : esc(mm[0])} <b>${nf(Math.round(ex.homes[k]))}</b> <span class="doux">${pctFin(ex.homes[k] / total)}</span></span>` : "")).join("");
+      // a sample (an engine that sends fewer cells than it has experts) is one honeycomb, not a block per layer
+      const em = carte.m && carte.m.em, echantillon = !!em && (em.tier || []).length < (em.total || 0);
       $("ex-note").textContent = carte.mode === "place"
         ? "Placement: where each expert is kept now. Hover an expert for its figures."
-        : "One hexagon per expert, one block per layer. The color says where it is kept, the brightness how much it was used in the last seconds. Hover an expert for its figures.";
+        : echantillon
+          ? `A sample of ${nf((em.tier || []).length)} of the ${nf(em.total)} experts, spread over every layer: one hexagon each. The color says where it is kept, the brightness how much it was used in the last seconds. Hover an expert for its figures.`
+          : "One hexagon per expert, one block per layer. The color says where it is kept, the brightness how much it was used in the last seconds. Hover an expert for its figures.";
     }
   }
 
@@ -972,6 +976,9 @@ const Moniteur = (() => {
         if (w >= (W < 560 ? (parCouche > 256 ? 4.6 : 5.6) : (parCouche > 256 ? 6.2 : 7.4))) { par = b; break; }
         par = 1;
       }
+      // full rows when a divisor of the layer count is within 2 blocks of the most that fit (Inkling's 24 layers in
+      // three rows of 8, not 9, 9 and 6 with a gap at the right of the last row)
+      for (let b = par; b >= Math.max(1, par - 2); b--) if (couches % b === 0) { par = b; break; }
       w = Math.min(14, (W - (par - 1) * ecart) / (par * (cols + 0.5)));
       rayon = w / Math.sqrt(3);
       const largeurBloc = (cols + 0.5) * w, hauteurBloc = (rangs - 1) * 1.5 * rayon + 2 * rayon;
@@ -989,8 +996,11 @@ const Moniteur = (() => {
       H = Math.ceil(Math.floor((couches - 1) / par) * pasY + titre + hauteurBloc + 2);
       return {W, H, cx, cy, rayon, w, blocs, complet, cols};
     }
-    // a sample: one honeycomb, as wide as the box
-    const cols = Math.max(8, Math.round(Math.sqrt(n * (W / 360)))), rangs = Math.ceil(n / cols);
+    // a sample: one honeycomb, as wide as the box: hexagons of at most 18 px across and as many columns as fill the width
+    // (the columns were sized for a square-ish honeycomb, and the 18 px cap left a gap at the right of a wide box)
+    let cols = Math.max(8, Math.round(Math.sqrt(n * (W / 360))));
+    if (W / (cols + 0.5) > 18) cols = Math.max(8, Math.min(n, Math.ceil(W / 18 - 0.5)));
+    const rangs = Math.ceil(n / cols);
     const w = Math.min(18, W / (cols + 0.5));
     rayon = w / Math.sqrt(3);
     for (let i = 0; i < n; i++) {

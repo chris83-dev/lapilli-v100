@@ -101,6 +101,10 @@ void gated_mlp_clamped(const NativeExpertLayout& L, float swiglu_limit, const vo
 /// kernels even with GU_MMA=1.  Bitwise the same results (native_grouped_parity checks it); kept for A/B
 /// timing.  Set before graph capture; captured graphs keep theirs.
 void native_grouped_set_v1(bool v1);
+/// (Lapilli, tests) the blocks per SM the experts' kernels at n_embd 2304 / n_ff 1152 are compiled for (the same bits):
+/// gate/up 1 to 4 (1: its original bounds), down 0 to 4 (0: its original bounds); gu 0 = both as BASALT_EXPERTS_MINB says
+/// (unset: by format, as measured on a V100).
+void native_grouped_set_minb(int gu, int down);
 /// What those switches say now, for kernels built on this file's device code elsewhere.
 int native_grouped_gu2();
 bool native_grouped_v1();

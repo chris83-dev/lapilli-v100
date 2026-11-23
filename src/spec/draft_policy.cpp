@@ -11,6 +11,13 @@ namespace {
 // sits between the measured curves: steeper with every missed expert on the CPU, flatter with the default CPU/DMA split.
 constexpr double kShape[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6,
                                                     3.95, 4.3, 4.65, 5.0, 5.35, 5.7, 6.05, 6.4};
+// (Lapilli) the shape with a V100 as the main card, measured on one (the Flash-Next UD-Q4_K_XL over two V100s,
+// basalt-bench's conv and prose fixtures, verify ms by window size): a window of t tokens costs about 1 + 0.16 (t - 1)
+// windows of one (t = 2: 1.13 to 1.17, 4: 1.41 to 1.47, 8: 1.93 to 2.15), the fixed latency of a V100 window weighing
+// more than on Blackwell. With Basalt's shape the policies that do not read round times (Flash-Next) took windows too
+// narrow there: 3.52 tokens a window on its long replies against 3.68 for the timed policy, about 1.6 % slower a token.
+constexpr double kShapeV70[DraftPolicy::kMaxT + 1] = {0.0, 1.0, 1.16, 1.32, 1.48, 1.64, 1.8, 1.96, 2.12,
+                                                      2.28, 2.44, 2.6, 2.76, 2.92, 3.08, 3.24, 3.4};
 // A round's cost is scale x base(size): the scale follows every round fast (the context grows, the tiers move, a
 // request's first windows run cold), each size's base follows its own rounds slowly, so the costs of sizes not taken
 // lately move with the ones taken
@@ -38,8 +45,8 @@ constexpr double kProbeChance = 0.85;   // the joint chance at which a drafter w
 
 }  // namespace
 
-DraftPolicy::DraftPolicy(int max_t, double margin, bool timed)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin), timed_(timed) {}
+DraftPolicy::DraftPolicy(int max_t, double margin, bool timed, bool v100_shape)
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin), timed_(timed), shape_(v100_shape ? kShapeV70 : kShape) {}
 
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
@@ -85,7 +92,7 @@ double DraftPolicy::base(int t) const {
         const double b = base_from(t, lately);
         if (b > 0) return b;
     }
-    return kShape[t];
+    return shape_[t];
 }
 
 double DraftPolicy::base_from(int t, bool lately) const {
@@ -100,8 +107,8 @@ double DraftPolicy::base_from(int t, bool lately) const {
     if (lo > 0 && hi > 0) return base_[lo] + (base_[hi] - base_[lo]) * (double) (t - lo) / (double) (hi - lo);
     if (lo > 0 && below > 0)
         return base_[lo] + std::max(0.0, (base_[lo] - base_[below]) / (double) (lo - below)) * (double) (t - lo);
-    if (lo > 0) return base_[lo] * kShape[t] / kShape[lo];
-    if (hi > 0) return base_[hi] * kShape[t] / kShape[hi];
+    if (lo > 0) return base_[lo] * shape_[t] / shape_[lo];
+    if (hi > 0) return base_[hi] * shape_[t] / shape_[hi];
     return -1.0;
 }
 
@@ -228,9 +235,9 @@ void DraftPolicy::observe_window(const float* chance, int t, int accepted, doubl
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
     ++round_;
-    if (!timed_) round_ms = kShape[t];
+    if (!timed_) round_ms = shape_[t];
     if (round_ms > 0) {
-        if (scale_ <= 0) scale_ = round_ms / kShape[t];          // the first round sets the scale
+        if (scale_ <= 0) scale_ = round_ms / shape_[t];          // the first round sets the scale
         if (!recent(t)) {                                        // new, or measured too long ago: start over from
             base_[t] = base(t);                                  // what the other sizes imply
             base_n_[t] = kBasePrior;

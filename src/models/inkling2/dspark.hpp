@@ -78,6 +78,9 @@ public:
     DsHead head_args() const;
 
     DsparkGeometry geo;
+    /// (Lapilli) the block's products kept in Q8_0 by finish(): a card without FP4 window gemms (a V100), whose block runs
+    /// them through native_q8_0_mmvq (on by default there; BASALT_INK_DSPARK_V70=0 turns the drafter off)
+    bool q8_products = false;
     int n_vocab = 0;
     float logit_softcap = 30.f;
     std::vector<DsparkLayer> layer;
@@ -165,6 +168,9 @@ private:
     };
     void* dev(size_t bytes, bool& ok);
     void stage(int k, int n, void* stream);
+    // (Lapilli) the block's products on a V100 (DsparkWeights::q8_products): q8_1 rows through native_q8_0_mmvq
+    void v70_post_attention(const DsparkLayer& L, const DsparkGeometry& d, void* stream);
+    void v70_qkv(const DsparkLayer& L, const DsparkGeometry& d, void* stream);
     bool stage_graph(int k, int n, void* stream);
     const DsparkWeights* w_ = nullptr;
     std::vector<void*> allocs_, pinned_;
@@ -184,6 +190,10 @@ private:
     float *x_ = nullptr, *q_ = nullptr, *qr_ = nullptr, *attn_ = nullptr, *h_ = nullptr, *att_scr_ = nullptr;
     void *act_a_ = nullptr, *act_h_ = nullptr;   ///< the window gemm's bf16 rows: a product's input, SwiGLU's output
     basalt::kernels::wgemm::Workspace ws_;
+    // (Lapilli) the V100 block: q8_1 rows of the normed state, of the attention and of h; the normed state, a product's
+    // output before it is added, the gate and up rows
+    void *v70_a_ = nullptr, *v70_ao_ = nullptr, *v70_ah_ = nullptr;
+    float *v70_xn_ = nullptr, *v70_t_ = nullptr, *v70_g_ = nullptr, *v70_u_ = nullptr;
     int32_t* pos3b_ = nullptr;
     int64_t att_cells_ = 0;
     // head

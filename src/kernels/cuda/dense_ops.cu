@@ -156,7 +156,7 @@ __global__ void __launch_bounds__(32) bf16_rows_dot_kernel(const float* __restri
 // Each output runs the kernel above's chain (the same tf32 terms and mma steps in k order), so the results are the same bits.
 constexpr int RT_W = 4, RT_KC = 128, RT_XS = RT_KC + 8, RT_WS = RT_KC + 8;
 __device__ __forceinline__ void rt_cp16(void* dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src));
+    basalt::volta::cp_async_cg16((unsigned) __cvta_generic_to_shared(dst), src);
 }
 __global__ void __launch_bounds__(32 * RT_W) bf16_rows_dot_tiles_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
                                                                         float* __restrict__ y, int64_t T, int64_t N, int64_t K) {
@@ -177,16 +177,16 @@ __global__ void __launch_bounds__(32 * RT_W) bf16_rows_dot_tiles_kernel(const fl
             const int r = q / (RT_KC / 8), k8 = (q % (RT_KC / 8)) * 8;
             rt_cp16(&ws[buf][r][k8], w + min(nb + r, N - 1) * K + k0 + k8);
         }
-        asm volatile("cp.async.commit_group;\n" ::);
+        basalt::volta::cp_async_commit();
     };
     float acc[4] = {};
     load(0, 0);
     for (int kc = 0; kc < nkc; ++kc) {
         if (kc + 1 < nkc) {
             load((kc + 1) & 1, kc + 1);
-            asm volatile("cp.async.wait_group 1;\n" ::);
+            basalt::volta::cp_async_wait<1>();
         } else {
-            asm volatile("cp.async.wait_group 0;\n" ::);
+            basalt::volta::cp_async_wait<0>();
         }
         __syncthreads();
         const int buf = kc & 1;
@@ -201,12 +201,10 @@ __global__ void __launch_bounds__(32 * RT_W) bf16_rows_dot_tiles_kernel(const fl
                 const unsigned a0 = tf32_of(fa.x), a1 = tf32_of(fb.x), a2 = tf32_of(fa.y), a3 = tf32_of(fb.y);
                 const unsigned l0 = tf32_of(fa.x - __uint_as_float(a0)), l1 = tf32_of(fb.x - __uint_as_float(a1));
                 const unsigned l2 = tf32_of(fa.y - __uint_as_float(a2)), l3 = tf32_of(fb.y - __uint_as_float(a3));
-                asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                             : "r"(l0), "r"(l1), "r"(l2), "r"(l3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
-                asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                             : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(wv << 16), "r"(wv & 0xFFFF0000u));
+                basalt::volta::mma_1688_f32_tf32(acc[0], acc[1], acc[2], acc[3], l0, l1, l2, l3,
+                                                  wv << 16, wv & 0xFFFF0000u, acc[0], acc[1], acc[2], acc[3]);
+                basalt::volta::mma_1688_f32_tf32(acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3,
+                                                  wv << 16, wv & 0xFFFF0000u, acc[0], acc[1], acc[2], acc[3]);
             }
         }
         __syncthreads();

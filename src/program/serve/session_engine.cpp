@@ -311,14 +311,6 @@ public:
     bool slots_share_cells() const override { return false; }
     int64_t slot_context(int) const override { return o.max_context; }
     bool slot0_solo() const override { return o.batch > 0; }
-    // the console's expert figures (console_stats.hpp), from the solo session (Lapilli: as upstream Basalt, ff0b978d)
-    LookupCounts lookup_counts() override {
-        const basalt::model::ModelSession::ExpertCounts c = sessions_[0]->expert_counts();
-        return {c.hits, c.lookups, c.offloaded, c.files};
-    }
-    bool expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) override {
-        return sessions_[0]->expert_map(total, homes, routed);
-    }
 
     /// The running state at `to`, kept in the chain; the oldest goes first past --prompt-cache.
     bool checkpoint_at(int64_t to, ConvCheckpoint::Source source, const std::vector<int64_t>& prompt) {
@@ -757,7 +749,6 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
     BSlot& sl = bs[(size_t) b];
     set_active(b);
     const int T = w.T;
-    const int64_t sent0 = sl.produced;   // the console's tokens of this window (stats_window below)
     std::vector<int32_t>& win_ = w.win;
     std::vector<int32_t>& out_ = w.out;
     int a = 0;

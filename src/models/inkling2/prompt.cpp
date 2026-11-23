@@ -7,6 +7,8 @@
 // its last positions moved in) and the convolution rings' last kConvRing positions.
 #include "models/inkling2/prompt.hpp"
 
+#include <atomic>
+
 #include "basalt/kernels/dense_ops.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/router.hpp"
@@ -577,8 +579,23 @@ private:
     // as two FP4 terms (its rounding and the rounding of the rest, E4M3 scales per 16 under one token scale, about 8 bits;
     // one FP4 term costs KLD 0.0025 -> 0.0041), both through each weight fragment on one fp32 chain. Gate/up from the token
     // planes into H as the softcapped SwiGLU, H rounded per expert tile, then down into the pairs' rows.
-    bool fp4_shape() const { return g_.n_embd == 2304 && g_.n_ff_exp == 1152 && g_.n_expert <= 1024; }
-    bool mxfp8_shape() const { return g_.n_embd % 128 == 0 && g_.n_ff_exp % 128 == 0 && g_.n_expert <= 1024; }
+    // (from Csavoldi's Volta port, MIT) the FP4 and MXFP8 block-scaled products need Blackwell's tensor cores; Volta runs
+    // the NVFP4 blobs through MMQ (a MXFP8 pack has no Volta path: the DQ8 pack keeps those layers in Q8_0)
+    static bool fp4_hardware() {
+        static std::atomic<int> cc = -1;
+        if (cc.load(std::memory_order_acquire) < 0) {
+            int dev = 0, major = 0;
+            if (cudaGetDevice(&dev) != cudaSuccess ||
+                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            cc.store(major, std::memory_order_release);
+        }
+        return cc.load(std::memory_order_acquire) >= 10;
+    }
+    bool fp4_shape() const { return fp4_hardware() && g_.n_embd == 2304 && g_.n_ff_exp == 1152 && g_.n_expert <= 1024; }
+    bool mxfp8_shape() const { return fp4_hardware() && g_.n_embd % 128 == 0 && g_.n_ff_exp % 128 == 0 && g_.n_expert <= 1024; }
     void experts_mxfp8(const LayerWeights& w, int rows) {
         const int E = g_.n_embd, F = g_.n_ff_exp, n = g_.n_expert, pairs = rows * g_.n_used;
         const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);

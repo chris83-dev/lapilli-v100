@@ -1,4 +1,5 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/models/qwen4exp/draft_shape.hpp"
 #include "context.hpp"
 
 namespace basalt::models::qwen4exp::generate {
@@ -203,7 +204,7 @@ int decode(Context& context) {
             return 1;
         }
         basalt::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-        basalt::spec::DraftPolicy policy(o.spec, 0.03, false);   // MTP or lookup window (see draft_policy.hpp)
+        basalt::spec::DraftPolicy policy(o.spec, 0.03, false, draft_v100_shape());   // MTP or lookup window (see draft_policy.hpp)
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         if (o.suffix_draft > 0) {

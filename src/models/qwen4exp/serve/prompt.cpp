@@ -154,7 +154,8 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
             return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 15500;
         }();
         const int64_t peer_rows = runtime_.sp.peer_routed_rows_max();
-        if (!beside && peer_rows > 0 && tokens > peer_rows && tokens < routed_until) cap = std::min(cap, peer_rows);
+        // (upstream's member since the merge: the local `beside` of v0.5, set above for this read)
+        if (!beside_ && peer_rows > 0 && tokens > peer_rows && tokens < routed_until) cap = std::min(cap, peer_rows);
     }
     // Loan limits beside decoding slots: the loan stays within kLendCapDecoding slots (they keep their experts in
     // the cache) and takes only slots whose expert has a RAM copy (a lent slot is refilled from RAM, never read

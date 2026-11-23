@@ -1192,7 +1192,12 @@ int main() {
     test_sort();
     test_swiglu();
     test_experts(40);
-    test_experts_fp4();
+    // (Lapilli) the FP4 expert path is Blackwell's (FP4 tensor cores): on a V100 its kernels stop the process, and the
+    // Q8_0 experts after it (the DQ8 pack's last layers, by MMQ) would go unchecked. Skipped below compute capability 10.0.
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess) (void) cudaGetLastError();
+    if (major >= 10) test_experts_fp4();
+    else std::printf("%-44s skipped (FP4 tensor cores: compute capability 10.0 or later; %d.x here)\n", "experts FP4", major);
     test_experts(8);
     std::printf("inkling2_prompt_parity: %d failures\n", failures);
     return failures ? 1 : 0;

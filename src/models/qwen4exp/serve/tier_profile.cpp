@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/tier_profile.cpp - tier profile operations.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/models/qwen4exp/draft_shape.hpp"
 #include "qfn_state.hpp"
 
 #include <functional>
@@ -260,8 +261,8 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
     ba_win = 0;
     xq_saturated = false;
     prof_rank = rank_new;
-    (*policy) = basalt::spec::DraftPolicy(S, 0.03, false);
-    (*bpolicy) = basalt::spec::DraftPolicy(S, 0.03, false);
+    (*policy) = basalt::spec::DraftPolicy(S, 0.03, false, draft_v100_shape());
+    (*bpolicy) = basalt::spec::DraftPolicy(S, 0.03, false, draft_v100_shape());
     // a request after this reads its whole prompt
     ckd_finish();
     live.clear();

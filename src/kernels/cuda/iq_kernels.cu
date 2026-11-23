@@ -1687,6 +1687,30 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 // so 6 takes such windows in one pass; 8 would take ~64-80 registers.
 constexpr int GRP_NC = 6;
 
+// (Lapilli, V100) The blocks per SM the experts' kernels at n_embd 2304 / n_ff 1152 are compiled for (their launch bounds),
+// gate/up and down: on a V100 the gate/up rows of Q8_0 take 166 registers a thread (one block an SM), NVFP4's 80 (three).
+// The bound changes the registers and the schedule only: the same arithmetic, so the same bits. Measured on a V100
+// (inkling2_kernels_parity, gate/up + SwiGLU + down, 8 experts a row, against the original bounds): NVFP4 at 1 / 4
+// rows 85.4 / 215.3 us, gate/up at 4 blocks 82.6 / 205.3, down at 2 80.9 / 204.2; Q8_0 145.4 / 351.0, gate/up at 2
+// 123.4 / 297.2, down at 1 136.9 / 334.5. The defaults by format: gate/up 4 (NVFP4) or 2 (Q8_0), down 2 or 1. BASALT_EXPERTS_MINB="g,d" sets both formats: g 1 to 4 (1: gate/up's original bounds), d 0 to 4 (0: down's
+// original bounds, none); "1,0" is the code before. native_grouped_set_minb chooses for tests.
+int g_minb_gu = 0, g_minb_down = 0;   // 0: as the environment says
+int experts_minb(bool down, int type) {
+    static int env[2] = {-1, -1};
+    if (env[0] < 0) {
+        env[0] = env[1] = 0;
+        const char* e = std::getenv("BASALT_EXPERTS_MINB");
+        if (e != nullptr && e[0] >= '1' && e[0] <= '4' && e[1] == ',' && e[2] >= '0' && e[2] <= '4' && e[3] == 0) {
+            env[0] = e[0] - '0';
+            env[1] = e[2] - '0' + 10;   // + 10: set (down 0 is a value)
+        }
+    }
+    const int t = down ? g_minb_down : g_minb_gu;   // tests: > 0 the bound (down: 10 + bound)
+    if (t > 0) return down ? t - 10 : t;
+    if (down ? env[1] > 0 : env[0] > 0) return down ? env[1] - 10 : env[0];
+    return down ? (type == 40 ? 2 : 1) : (type == 8 ? 2 : 4);
+}
+
 // KC > 0: rows of KC calls (row_dot_multi's KC), and when every group has its own block row (no group stride) the
 // dependents (the SwiGLU, then down) are let in at the start, so their launches and down's weight prefetch overlap the
 // last wave; with the stride the waiting blocks would hold their slots through several waves.
@@ -2507,13 +2531,14 @@ __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_
 // block's first group's rows are prefetched into L2 before the wait.
 constexpr int kDownSub8Calls = 72;
 constexpr int kDownSub8Rows = 32;
-template<int TD, bool DEP = false>
-__global__ void __launch_bounds__(256) native_down_sub8_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                               const int32_t* __restrict__ grp_start,
-                                                               const int32_t* __restrict__ n_groups,
-                                                               const int32_t* __restrict__ ent_dst,
-                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
-                                                               float* __restrict__ out) {
+// (Lapilli) the kernel's body, inlined into native_down_sub8_kernel (its original launch bounds) and native_down_sub8_mb_kernel
+template<int TD, bool DEP>
+__device__ __forceinline__ void down_sub8_body(const unsigned long long* __restrict__ grp_ptr,
+                                               const int32_t* __restrict__ grp_start,
+                                               const int32_t* __restrict__ n_groups,
+                                               const int32_t* __restrict__ ent_dst,
+                                               const block_q8_1* __restrict__ hq, const NativeExpertLayout& L,
+                                               float* __restrict__ out) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     if constexpr (DEP) {
@@ -2560,6 +2585,25 @@ __global__ void __launch_bounds__(256) native_down_sub8_kernel(const unsigned lo
             }
         }
     }
+}
+template<int TD, bool DEP = false>
+__global__ void __launch_bounds__(256) native_down_sub8_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                               const int32_t* __restrict__ grp_start,
+                                                               const int32_t* __restrict__ n_groups,
+                                                               const int32_t* __restrict__ ent_dst,
+                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                               float* __restrict__ out) {
+    down_sub8_body<TD, DEP>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+}
+// (Lapilli, V100) the same body compiled for MINB blocks an SM (experts_minb): the same bits
+template<int TD, bool DEP, int MINB>
+__global__ void __launch_bounds__(256, MINB) native_down_sub8_mb_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                        const int32_t* __restrict__ grp_start,
+                                                                        const int32_t* __restrict__ n_groups,
+                                                                        const int32_t* __restrict__ ent_dst,
+                                                                        const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                                        float* __restrict__ out) {
+    down_sub8_body<TD, DEP>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
 
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
@@ -3228,7 +3272,16 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
     if constexpr (TG == 40 || TG == 8 || TG == 46) {   // n_embd 2304 (NVFP4 rows of 144 calls, Q8_0 of 288): the unrolled row
         constexpr int kc = TG == 40 ? 144 : 288;
         if (!g_old_kernels && L.n_embd == 2304) {
-            native_gu_multi_kernel<TG, false, kc><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            if constexpr (TG == 40 || TG == 8) {
+                switch (experts_minb(false, TG)) {   // (Lapilli) the blocks per SM compiled for: the same bits
+                case 2: native_gu_multi_kernel<TG, false, kc, 2><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+                case 3: native_gu_multi_kernel<TG, false, kc, 3><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+                case 4: native_gu_multi_kernel<TG, false, kc, 4><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+                default: native_gu_multi_kernel<TG, false, kc><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+                }
+            } else {
+                native_gu_multi_kernel<TG, false, kc><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            }
             return;
         }
     }
@@ -3280,8 +3333,24 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (!g_grouped_v1 && down_sub8<TD>(L)) {
         const dim3 g8((unsigned) ((L.n_embd + kDownSub8Rows - 1) / kDownSub8Rows), grid.y);
-        if (dep) launch_dependent(native_down_sub8_kernel<TD, true>, g8, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-        else native_down_sub8_kernel<TD><<<g8, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        // (Lapilli) the blocks per SM compiled for, at NVFP4 and Q8_0 (the same bits)
+        const int mb = (TD == 40 || TD == 8) ? experts_minb(true, TD) : 0;
+#define DOWN_MB(M) \
+        if (dep) launch_dependent(native_down_sub8_mb_kernel<TD, true, M>, g8, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
+        else native_down_sub8_mb_kernel<TD, false, M><<<g8, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        bool done = false;
+        if constexpr (TD == 40 || TD == 8) {
+            done = mb >= 1 && mb <= 4;
+            if (mb == 1) { DOWN_MB(1) }
+            else if (mb == 2) { DOWN_MB(2) }
+            else if (mb == 3) { DOWN_MB(3) }
+            else if (mb == 4) { DOWN_MB(4) }
+        }
+#undef DOWN_MB
+        if (!done) {   // the original launch bounds
+            if (dep) launch_dependent(native_down_sub8_kernel<TD, true>, g8, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            else native_down_sub8_kernel<TD><<<g8, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        }
     }
     else if (dep) {   // BASALT_EXP_LB >= 1: the down kernel at 3 blocks per SM (at 4 for level 3)
         if (exp_lb_level() == 3)
@@ -3462,6 +3531,10 @@ void native_expert_set_mode(int mode, int phase) {
 }
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+void native_grouped_set_minb(int gu, int down) {   // gu 1..4, down 0..4 (0: its original bounds); gu 0: as the environment says
+    g_minb_gu = gu;
+    g_minb_down = gu == 0 ? 0 : down + 10;
+}
 bool native_grouped_v1() { return g_grouped_v1; }
 int native_expert_phase() { return g_exp_phase; }
 void native_grouped_set_mma_hint(bool on) {

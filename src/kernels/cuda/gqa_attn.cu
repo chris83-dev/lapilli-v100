@@ -1403,10 +1403,7 @@ void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scr
     // is missing, waits on its extra barriers): every segment with an even number of tiles.  The same bits either way.
     bool pairs = true;
     for (int k = 0; k < segs.n; ++k) pairs = pairs && (segs.tile0[k + 1] - segs.tile0[k]) % 2 == 0;
-    if (segs.q8[0].k)   // (Lapilli) an int8 cache: upstream's kernel on every card (Volta's own kernels below read F16)
-        launch_pdl(decode_mma_kernel<HD, true>, dim3((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]), dim3(128),
-                   0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
-    else if (volta_decode() && decode_variant() == 4) {   // Volta's own instruction: row groups of 8, 1 to 4 a block
+    if (volta_decode() && decode_variant() == 4) {   // Volta's own instruction: row groups of 8, 1 to 4 a block
         int most = 1;
         for (int k = 0; k < segs.n; ++k) most = std::max(most, ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 7) / 8);
         const int rg = most >= 4 ? 4 : most >= 2 ? 2 : 1;
@@ -1433,6 +1430,9 @@ void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scr
                    q, n_head, n_kv, segs, n_chunks, scale, scratch);
     } else if (volta_decode())
         launch_pdl(decode_wmma_kernel<HD>, dim3((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]), dim3(128), 0, s,
+                   q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    else if (segs.q8[0].k)   // (Lapilli) upstream's kernels off the V100 (Volta's above read the int8 cache themselves)
+        launch_pdl(decode_mma_kernel<HD, true>, dim3((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]), dim3(128), 0, s,
                    q, n_head, n_kv, segs, n_chunks, scale, scratch);
     else
         launch_pdl(decode_mma_kernel<HD, false>, dim3((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]), dim3(128), 0, s,

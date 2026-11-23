@@ -368,7 +368,22 @@ void test_head() {
         dspark_head_base(h, d_hq, R, d_approx, nullptr);
         for (int i = 0; i < R; ++i) dspark_head_pick(h, d_hq, d_lq + i * lrow, d_approx, i, scr, d_prev, d_ids, d_conf, d_w1, d_w1r, nullptr);
         const auto ids = host(d_ids, 8);
-        rows_ok = rows_ok && std::memcmp(host(d_w1r, kDsRank).data(), w1.data() + (size_t) ids[R - 1] * kDsRank, kDsRank * 2) == 0;
+        {
+            const auto got_row = host(d_w1r, kDsRank);
+            const bool same = std::memcmp(got_row.data(), w1.data() + (size_t) ids[R - 1] * kDsRank, kDsRank * 2) == 0;
+            if (!same && rows_ok) {   // (Lapilli) the first block whose copied row differs: what it holds instead
+                int differ_at = -1;
+                for (int k = 0; k < kDsRank && differ_at < 0; ++k)
+                    if (got_row[(size_t) k] != w1[(size_t) ids[R - 1] * kDsRank + (size_t) k]) differ_at = k;
+                std::printf("  w1 row of the last pick (token %d): first difference at value %d, got %u expected %u "
+                            "(row pattern: row*131+k mod 65536; plant %s, strength %.1f, clustered %d)\n",
+                            (int) ids[R - 1], differ_at, (unsigned) got_row[(size_t) differ_at],
+                            (unsigned) w1[(size_t) ids[R - 1] * kDsRank + (size_t) differ_at], plant.empty() ? "none" : "given",
+                            (double) strength, (int) clustered);
+                for (int i = 0; i < R; ++i) std::printf("    draft %d: token %d\n", i, (int) ids[(size_t) i]);
+            }
+            rows_ok = rows_ok && same;
+        }
         const auto cf = host(d_conf, 8);
         for (int i = 0; i < R; ++i) {
             dspark_head_exact(h, d_hq, d_lq + i * lrow, i, d_logits, nullptr);

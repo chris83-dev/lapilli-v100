@@ -9,6 +9,7 @@
 // them to the q8_1 blocks of the output projection.
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
+#include "basalt/kernels/volta_compat.cuh"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "prep.cuh"
 
@@ -18,7 +19,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -26,6 +29,29 @@ namespace basalt::models::inkling2 {
 namespace {
 
 namespace bk = basalt::kernels;
+
+// Volta (this fork's target) has no thread block clusters: the fused window kernel is Hopper-and-later, and the
+// host takes the split-and-combine path there instead.
+bool cluster_device() {
+    static std::atomic<int> cc[64];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        cudaGetLastError();
+        return false;
+    }
+    int c = cc[dev].load(std::memory_order_acquire);
+    if (c == 0) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        c = 10 * major + minor;
+        cc[dev].store(c, std::memory_order_release);
+    }
+    return c >= 90;
+}
 
 constexpr int kWarps = 4;
 constexpr int kTile = 32;
@@ -297,6 +323,250 @@ __global__ void __launch_bounds__(kHeadDim) attn_combine_kernel(AttnArgs a, int 
     }
 }
 
+// ---- (Lapilli, V100) a decode window's rows over one key/value head: each key and value read once ----------------------
+//
+// attn_split_kernel takes a row a block, so a window of T rows reads every key and value of a full visit T times: over a
+// long context that is most of a window's time (64K keys: ~0.4 ms a row and a visit, 8 full visits a token). Here a block
+// takes up to kRowsBlock rows of one conversation's window, one key/value head and one slice, in rounds of kUnit keys: the
+// block's threads load a round's key and value rows once into shared memory (fp16; E4M3 codes are exact in fp16), the next
+// round's loads in flight during this round's work, and each row has four warps there, warp v doing what warp v of
+// attn_split_kernel does for that row, in the same order: its slices from its own key count, the tile of 32 keys at v x 32
+// in each round (a lane a key: scored from the same values in the same order; then the same online softmax, and the values
+// summed four channels a lane), then the same merge of the four warps in warp order. A row's keys past its own end are
+// treated as attn_split_kernel treats them (scored -inf, their values read as zero), so a row's bits are those it has alone
+// (kernels_parity checks it). Rows whose slices differ in size (a window across a multiple of kUnit x kMaxSplits keys) run
+// in turn, a class of rows at a time. Full visits of one conversation only: a window ring's rows start their slices at
+// different keys, and a batch window's rows read different caches. BASALT_INK_ATTN_ROWS=0: attn_split_kernel for every row.
+constexpr int kRowsBlock = 4;
+constexpr int kRowsThreads = kRowsBlock * kWarps * 32;   // four warps a row
+constexpr int kKStride = kHeadDim / 2 + 4;               // words a key row takes in shared memory (as kVStride)
+
+struct SmemRows {
+    union {
+        struct {
+            uint32_t k[kUnit][kKStride];   // a round's key rows as fp16 pairs
+            uint32_t v[kUnit][kVStride];   // and its value rows
+        } t;
+        struct {   // after a class's rounds: each row's four warps' parts, merged in warp order
+            float m[kRowsBlock][kWarps][kGroup], l[kRowsBlock][kWarps][kGroup];
+            float acc[kRowsBlock][kWarps][kGroup][kHeadDim];
+        } mg;
+    };
+    float q[kRowsBlock][kGroup][kHeadDim];
+    float rs[kRowsBlock][kGroup][kRel];
+};
+
+template <bool FP8>
+__global__ void __launch_bounds__(kRowsThreads, 1) attn_rows_kernel(AttnArgs a, int rows, int z, float* __restrict__ part_ml,
+                                                                     float* __restrict__ part_acc) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    SmemRows& sm = *reinterpret_cast<SmemRows*>(smem_raw);
+    const int r0 = blockIdx.x * kRowsBlock, g = blockIdx.y, s = blockIdx.z;
+    const int pw = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int v = pw % kWarps, ri = pw / kWarps;   // this warp: warp v of row r0 + ri
+    bk::pdl_wait();
+    bk::pdl_launch_dependents();
+    // the block's rows (a full visit: a row's keys are 0..p) and the size of their slices
+    int pp[kRowsBlock], span[kRowsBlock];
+    unsigned todo = 0;
+#pragma unroll
+    for (int i = 0; i < kRowsBlock; ++i) {
+        pp[i] = 0;
+        span[i] = kUnit;
+        if (r0 + i < rows) {
+            pp[i] = a.pos[r0 + i];
+            span[i] = span_of(pp[i] + 1);
+            if (s * span[i] < pp[i] + 1) todo |= 1u << i;
+        }
+    }
+    if (todo == 0) return;   // past every row's slices (the whole block)
+    int my_p = 0;
+#pragma unroll
+    for (int i = 0; i < kRowsBlock; ++i)
+        if (i == ri) my_p = pp[i];
+    constexpr int kRowBytes = FP8 ? kHeadDim : kHeadDim * 2;
+    constexpr int kChunks = kUnit * kRowBytes / 16;                 // 16-byte pieces of a round's keys (and of its values)
+    constexpr int kPer = kChunks / kRowsThreads;                    // a thread's pieces of each
+    constexpr int kRowChunks = kRowBytes / 16;
+    static_assert(kChunks % kRowsThreads == 0, "a round's pieces split evenly over the threads");
+    const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
+    const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
+    for (int i = threadIdx.x; i < kRowsBlock * kGroup * kHeadDim; i += blockDim.x) {
+        const int rr = i / (kGroup * kHeadDim), j = i % (kGroup * kHeadDim);
+        if (r0 + rr < rows) sm.q[rr][j / kHeadDim][j % kHeadDim] = a.q[((size_t) (r0 + rr) * kHeads + g * kGroup) * kHeadDim + j];
+    }
+    for (int i = threadIdx.x; i < kRowsBlock * kGroup * kRel; i += blockDim.x) {
+        const int rr = i / (kGroup * kRel), j = i % (kGroup * kRel);
+        if (r0 + rr < rows) sm.rs[rr][j / kRel][j % kRel] = a.r[((size_t) (r0 + rr) * kHeads + g * kGroup) * kRel + j];
+    }
+    while (todo) {
+        // a class: the rows left whose slices have the first one's size; each row's slice ends at its own last key
+        const int first = __ffs(todo) - 1;
+        int cspan = kUnit;
+#pragma unroll
+        for (int i = 0; i < kRowsBlock; ++i)
+            if (i == first) cspan = span[i];
+        const int s_lo = s * cspan;
+        unsigned cls = 0;
+        int hi_max = 0, my_hi = 0;
+#pragma unroll
+        for (int i = 0; i < kRowsBlock; ++i)
+            if ((todo >> i & 1u) && span[i] == cspan) {
+                cls |= 1u << i;
+                const int h = min(pp[i] + 1, s_lo + cspan);
+                hi_max = max(hi_max, h);
+                if (i == ri) my_hi = h;
+            }
+        todo &= ~cls;
+        const bool mine = (cls >> ri & 1u) != 0;   // this warp's row is in the class (my_hi is its slice's end)
+        // a round's pieces: this thread's of the keys and of the values (zero past the class's last key)
+        uint4 pk[kPer], pv[kPer];
+        const auto load_round = [&](int b0) {
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) {
+                const int c = threadIdx.x + i * kRowsThreads, key = b0 + c / kRowChunks, part = c % kRowChunks;
+                if (key < hi_max) {
+                    const size_t off = (size_t) (key % a.cap) * kKvHeads * kRowBytes + (size_t) part * 16;
+                    pk[i] = *reinterpret_cast<const uint4*>(kbase + off);
+                    pv[i] = *reinterpret_cast<const uint4*>(vbase + off);
+                } else {
+                    pk[i] = pv[i] = make_uint4(0, 0, 0, 0);
+                }
+            }
+        };
+        const auto store_round = [&] {
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) {
+                const int c = threadIdx.x + i * kRowsThreads, key = c / kRowChunks, part = c % kRowChunks;
+                if constexpr (FP8) {   // 16 codes -> 16 fp16 values (exact)
+                    float fk[16], fv[16];
+                    unpack16_fp8(pk[i], fk);
+                    unpack16_fp8(pv[i], fv);
+                    uint32_t wk[8], wv[8];
+#pragma unroll
+                    for (int d = 0; d < 8; ++d) {
+                        const __half2 hk = __floats2half2_rn(fk[2 * d], fk[2 * d + 1]);
+                        const __half2 hv = __floats2half2_rn(fv[2 * d], fv[2 * d + 1]);
+                        wk[d] = *reinterpret_cast<const uint32_t*>(&hk);
+                        wv[d] = *reinterpret_cast<const uint32_t*>(&hv);
+                    }
+                    *reinterpret_cast<uint4*>(&sm.t.k[key][part * 8]) = make_uint4(wk[0], wk[1], wk[2], wk[3]);
+                    *reinterpret_cast<uint4*>(&sm.t.k[key][part * 8 + 4]) = make_uint4(wk[4], wk[5], wk[6], wk[7]);
+                    *reinterpret_cast<uint4*>(&sm.t.v[key][part * 8]) = make_uint4(wv[0], wv[1], wv[2], wv[3]);
+                    *reinterpret_cast<uint4*>(&sm.t.v[key][part * 8 + 4]) = make_uint4(wv[4], wv[5], wv[6], wv[7]);
+                } else {
+                    *reinterpret_cast<uint4*>(&sm.t.k[key][part * 4]) = pk[i];
+                    *reinterpret_cast<uint4*>(&sm.t.v[key][part * 4]) = pv[i];
+                }
+            }
+        };
+        float m[kGroup], l[kGroup], acc[kGroup][4];
+#pragma unroll
+        for (int h = 0; h < kGroup; ++h) {
+            m[h] = -INFINITY;
+            l[h] = 0.f;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) acc[h][u] = 0.f;
+        }
+        load_round(s_lo);
+        for (int b0 = s_lo; b0 < hi_max; b0 += kUnit) {
+            __syncthreads();   // the round before is done with the tiles (or the class before with the merge)
+            store_round();
+            __syncthreads();
+            if (b0 + kUnit < hi_max) load_round(b0 + kUnit);   // in flight while this round is worked
+            const int t0 = b0 + v * kTile;
+            if (!mine || t0 >= my_hi) continue;   // the row's tiles for warp v end here (the whole warp)
+            const int key = t0 + lane;
+            const bool valid = key < my_hi;
+            // the lane's key scored for the row's three heads (attn_split_kernel's arithmetic: channels 0..127 in order)
+            float sc[kGroup] = {0.f, 0.f, 0.f};
+            const uint32_t* krow = sm.t.k[v * kTile + lane];
+#pragma unroll
+            for (int i = 0; i < kHeadDim / 8; ++i) {
+                float f[8];
+                unpack8_f16(*reinterpret_cast<const uint4*>(krow + 4 * i), f);
+#pragma unroll
+                for (int d = 0; d < 8; ++d)
+#pragma unroll
+                    for (int h = 0; h < kGroup; ++h) sc[h] = fmaf(sm.q[ri][h][8 * i + d], f[d], sc[h]);
+            }
+            const int dist = my_p - key;
+            float tv[kRel];
+#pragma unroll
+            for (int k = 0; k < kRel; ++k) tv[k] = valid && dist < kExtent ? a.rel_table[k * kExtent + dist] : 0.f;
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) {
+                float b = 0.f;
+#pragma unroll
+                for (int k = 0; k < kRel; ++k) b = fmaf(sm.rs[ri][h][k], tv[k], b);
+                sc[h] = valid ? sc[h] * a.scale + b : -INFINITY;
+            }
+            // the online softmax over the tile
+            float pr[kGroup];
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) {
+                const float mt = warp_max(sc[h]);
+                const float mn = fmaxf(m[h], mt);
+                const float corr = m[h] == -INFINITY ? 0.f : expf(m[h] - mn);
+                pr[h] = sc[h] == -INFINITY ? 0.f : expf(sc[h] - mn);
+                l[h] = l[h] * corr + warp_sum(pr[h]);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) acc[h][u] *= corr;
+                m[h] = mn;
+            }
+            // the tile's values; those past the row's last key read as zero, as attn_split_kernel loads them
+            const int nv = my_hi - t0;
+            for (int j = 0; j < kTile; ++j) {
+                uint2 u = *reinterpret_cast<const uint2*>(&sm.t.v[v * kTile + j][lane * 2]);
+                if (j >= nv) u = make_uint2(0u, 0u);
+                const float2 v01 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+                const float2 v23 = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+#pragma unroll
+                for (int h = 0; h < kGroup; ++h) {
+                    const float pj = __shfl_sync(0xffffffffu, pr[h], j);
+                    acc[h][0] = fmaf(pj, v01.x, acc[h][0]);
+                    acc[h][1] = fmaf(pj, v01.y, acc[h][1]);
+                    acc[h][2] = fmaf(pj, v23.x, acc[h][2]);
+                    acc[h][3] = fmaf(pj, v23.y, acc[h][3]);
+                }
+            }
+        }
+        // each row of the class: its four warps' parts of this slice, merged in warp order
+        __syncthreads();   // the rounds are done with the tiles: the merge takes their place
+        if (mine) {
+#pragma unroll
+            for (int h = 0; h < kGroup; ++h) {
+                if (lane == 0) {
+                    sm.mg.m[ri][v][h] = m[h];
+                    sm.mg.l[ri][v][h] = l[h];
+                }
+#pragma unroll
+                for (int u = 0; u < 4; ++u) sm.mg.acc[ri][v][h][lane * 4 + u] = acc[h][u];
+            }
+        }
+        __syncthreads();
+        for (int t = threadIdx.x; t < kRowsBlock * kGroup * kHeadDim; t += blockDim.x) {
+            const int rr = t / (kGroup * kHeadDim), h = t / kHeadDim % kGroup, d = t % kHeadDim;
+            if (!(cls >> rr & 1u)) continue;
+            float mm = -INFINITY;
+            for (int ww = 0; ww < kWarps; ++ww) mm = fmaxf(mm, sm.mg.m[rr][ww][h]);
+            float ll = 0.f, aa = 0.f;
+            for (int ww = 0; ww < kWarps; ++ww) {
+                if (sm.mg.m[rr][ww][h] == -INFINITY) continue;
+                const float f = expf(sm.mg.m[rr][ww][h] - mm);
+                ll = fmaf(sm.mg.l[rr][ww][h], f, ll);
+                aa = fmaf(sm.mg.acc[rr][ww][h][d], f, aa);
+            }
+            const size_t slot = ((size_t) (r0 + rr) * kHeads + g * kGroup + h) * z + s;
+            part_acc[slot * kHeadDim + d] = aa;
+            if (d == 0) {
+                part_ml[slot * 2] = mm;
+                part_ml[slot * 2 + 1] = ll;
+            }
+        }
+    }
+}
+
 // ---- the fused window attention ----------------------------------------------------------------------------------------
 //
 // A window of up to kFusedRows rows whose keys split in at most kClusterSplits slices of kUnit keys (every sliding-window
@@ -324,7 +594,7 @@ struct FusedSmem {
 };
 
 template <bool FP8, int ROWS>
-__global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
+__global__ void BASALT_CLUSTER_DIMS(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
     namespace cg = cooperative_groups;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     FusedSmem<ROWS>& fs = *reinterpret_cast<FusedSmem<ROWS>*>(smem_raw);
@@ -524,11 +794,12 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     // the slices' shared memory to the merging blocks: a release and an acquire of shared memory only (a cluster-wide
     // release of every state space is a GPU-scope fence that waits for the cache and ring stores; no block of the cluster
     // reads those)
-    asm volatile("fence.release.sync_restrict::shared::cta.cluster;\n\tbarrier.cluster.arrive.relaxed.aligned;\n\t"
-                 "barrier.cluster.wait.aligned;\n\tfence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
+    // (Lapilli) through BASALT_CLUSTER_ASM: a V100 compiles the kernel and never launches it (cluster_device())
+    BASALT_CLUSTER_ASM("fence.release.sync_restrict::shared::cta.cluster;\n\tbarrier.cluster.arrive.relaxed.aligned;\n\t"
+                       "barrier.cluster.wait.aligned;\n\tfence.acquire.sync_restrict::shared::cluster.cluster;");
     if (s < kGroup) {   // head g * 3 + s: the row's slices merged with the sink, gated, rounded to q8_1 (a warp a block of 32)
         const int h = s, d = threadIdx.x;
-        cg::cluster_group cluster = cg::this_cluster();
+        BASALT_CLUSTER_T cluster = BASALT_THIS_CLUSTER();   // (Lapilli) volta_compat.cuh's stand-in on a V100
         // every slice's maximum, sum and value read at once, then merged in slice order
         float pm[kClusterSplits], pl[kClusterSplits], pv[kClusterSplits];
 #pragma unroll
@@ -564,7 +835,19 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     // no block leaves while the merging blocks still read its slice: an arrival without release semantics (a release
     // here is a GPU-scope fence that waits for the q8_1 stores to be acknowledged); the merging blocks' remote loads
     // are complete, their values are in the stores above
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;" ::: "memory");
+    BASALT_CLUSTER_ASM("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;");
+}
+
+// BASALT_INK_ATTN_ROWS=0: attn_split_kernel for every row, as before attn_rows_kernel (to compare); the parity test may
+// choose (attention_rows_mode)
+std::atomic<int> rows_mode{0};
+bool rows_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BASALT_INK_ATTN_ROWS");
+        return !(e != nullptr && e[0] == '0' && e[1] == 0);
+    }();
+    const int m = rows_mode.load(std::memory_order_relaxed);
+    return m == 0 ? on : m == 2;
 }
 
 int launch_splits(int64_t max_keys) {
@@ -578,6 +861,8 @@ int opt_in_device() {
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= kOptInDevices) throw std::runtime_error("inkling2: device out of range");
     return dev;
 }
+
+void attention_rows_mode(int mode) { rows_mode.store(mode, std::memory_order_relaxed); }
 
 size_t attention_decode_scratch(int rows, int64_t max_keys) {
     const size_t slots = (size_t) rows * kHeads * (size_t) launch_splits(max_keys);
@@ -596,17 +881,32 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
         cudaFuncSetAttribute(attn_split_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         set = true;
     }
-    const dim3 grid((unsigned) rows, kKvHeads, (unsigned) z);
-    if (a.fp8) bk::launch_pdl(attn_split_kernel<true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
-    else bk::launch_pdl(attn_split_kernel<false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
-    check("attention_decode");
+    if (rows >= 2 && a.window == 0 && a.seg.at.n == 0 && rows_on()) {   // a window's rows share each tile's loads
+        static bool attr_rows[kOptInDevices] = {};
+        if (bool& set = attr_rows[opt_in_device()]; !set) {   // a block an SM, its shared memory past the default 48 KB
+            cudaFuncSetAttribute(attn_rows_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(SmemRows));
+            cudaFuncSetAttribute(attn_rows_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(SmemRows));
+            cudaFuncSetAttribute(attn_rows_kernel<false>, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(attn_rows_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared);
+            set = true;
+        }
+        const dim3 grid((unsigned) ((rows + kRowsBlock - 1) / kRowsBlock), kKvHeads, (unsigned) z);
+        if (a.fp8) bk::launch_pdl(attn_rows_kernel<true>, grid, dim3(kRowsThreads), sizeof(SmemRows), s, a, rows, z, part_ml, part_acc);
+        else bk::launch_pdl(attn_rows_kernel<false>, grid, dim3(kRowsThreads), sizeof(SmemRows), s, a, rows, z, part_ml, part_acc);
+        check("attention_decode (rows)");
+    } else {
+        const dim3 grid((unsigned) rows, kKvHeads, (unsigned) z);
+        if (a.fp8) bk::launch_pdl(attn_split_kernel<true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+        else bk::launch_pdl(attn_split_kernel<false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+        check("attention_decode");
+    }
     bk::launch_pdl(attn_combine_kernel, dim3((unsigned) rows, kHeads), dim3(kHeadDim), 0, s, a, z, (const float*) part_ml, (const float*) part_acc, out);
     check("attention_decode/combine");
 }
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
-    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0) {
+    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0 || !cluster_device()) {
         decode_prepare(pa, rows, stream);
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;

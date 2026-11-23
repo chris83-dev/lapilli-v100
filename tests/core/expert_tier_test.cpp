@@ -3,6 +3,7 @@
 #include "basalt/core/expert_tier.hpp"
 
 #include "basalt/core/loader.hpp"
+#include "basalt/core/vmm.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/platform/file.hpp"
 
@@ -212,7 +213,12 @@ int main() {
     // a bounded lend (ExpertTierSpec::lend_segment) with copies weighted by layer: half the arena goes, every layer keeps a
     // prefix of its slots in proportion to its share and its most recently used experts, every slot it says it holds has
     // the pack's bytes, and reclaim maps the slots again
-    {
+    // (Lapilli) a segmented arena needs CUDA virtual memory management (ExpertTier::open: core::vmm::supported()); without
+    // it (a V100 under Windows) partial_lend() is false by design and lend() gives the whole arena: skipped, as
+    // expert_cache_segmented_test is
+    if (!core::vmm::supported()) {
+        std::printf("expert_tier_test: bounded lend skipped (no CUDA virtual memory management here)\n");
+    } else {
         core::ExpertTierSpec spec;
         spec.area = "basalt test";
         spec.name = "test";

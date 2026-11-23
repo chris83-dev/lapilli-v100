@@ -31,7 +31,9 @@ public:
     /// pairs, all in VRAM, and each one's lookups since the last call; the first call starts the counting (all zero).
     void take(const std::vector<uint32_t>& counts, int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed) {
         total = (int64_t) counts.size();
-        if (pairs_.empty()) pairs_ = core::expert_map_pairs(total, core::ExpertMapTally::kCells);
+        // (Lapilli) every pair when there are at most kWholeMap of them (Inkling's 3,072: the Experts tab draws one block per
+        // layer, as for DeepSeek's whole map, core::ExpertTier::kMapAll), else the sample
+        if (pairs_.empty()) pairs_ = core::expert_map_pairs(total, total <= kWholeMap ? (int) total : core::ExpertMapTally::kCells);
         homes.assign(pairs_.size(), (uint8_t) core::ExpertHome::Vram);
         routed.assign(pairs_.size(), 0u);
         const bool first = last_.empty();
@@ -42,6 +44,8 @@ public:
             last_[i] = now;
         }
     }
+
+    static constexpr int64_t kWholeMap = 8192;   ///< the same bound as core::ExpertTier::kMapAll
 
 private:
     std::vector<int32_t> pairs_;

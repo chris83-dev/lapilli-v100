@@ -579,6 +579,13 @@ div.outil__cle { margin: 0 0 6px; }
 .creneaux[data-n="1"] .creneau > .ligne-barre, .creneaux[data-n="1"] .creneau > .barre { grid-column: 1 / -1; }
 .creneaux[data-n="1"] .creneau > .faits-ligne { grid-column: 1 / -1; }
 .creneau__bloc { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.creneau__zone { display: flex; flex-direction: column; gap: 8px; }   /* the experts bar, then its legend */
+/* (Lapilli) the three blocks side by side: the experts block as tall as the two charts
+   beside it (92 px), its bar on their base line (70 px), its legend on their row of labels; measured by the bench */
+@media (min-width: 1101px) {
+  .creneaux[data-n="1"] .creneau__zone { height: 92px; justify-content: flex-end; }
+  .creneaux[data-n="1"] .creneau__zone .repartition-legende { min-height: 13px; line-height: 13px; margin-bottom: 1px; }
+}
 
 /* Hardware */
 .materiel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }

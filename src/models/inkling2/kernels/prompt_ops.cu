@@ -1,5 +1,6 @@
 // src/models/inkling2/kernels/prompt_ops.cu - the prompt path's small kernels: the experts' plan as a stable counting sort
 // of a chunk's (row, slot) pairs by expert, and the staged sliding-window keys moved into the window rings.
+#include "basalt/kernels/volta_compat.cuh"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -164,24 +165,19 @@ void stage_to_ring(const void* k_stage, const void* v_stage, int64_t stage_cap, 
 namespace {
 
 __device__ __forceinline__ unsigned tf32_of(float f) {
-    unsigned r;
-    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(f));
-    return r;
+    return basalt::volta::cvt_rna_tf32(f);   // (Lapilli) Volta rounds with integer ops (volta_compat.cuh)
 }
 
 __device__ __forceinline__ void cp16_cg(void* dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src));
+    basalt::volta::cp_async_cg16((unsigned) __cvta_generic_to_shared(dst), src);   // (Lapilli) a synchronous copy on Volta
 }
 
 __device__ __forceinline__ void mma_tf32_2(float (&acc)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                            unsigned l0, unsigned l1, unsigned l2, unsigned l3, unsigned wv) {
     const unsigned b0 = wv << 16, b1 = wv & 0xFFFF0000u;
-    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                 : "r"(l0), "r"(l1), "r"(l2), "r"(l3), "r"(b0), "r"(b1));
-    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    // (Lapilli) the tf32 mma through volta_compat.cuh (emulated on Volta, the instruction elsewhere), as dense_ops.cu
+    basalt::volta::mma_1688_f32_tf32(acc[0], acc[1], acc[2], acc[3], l0, l1, l2, l3, b0, b1, acc[0], acc[1], acc[2], acc[3]);
+    basalt::volta::mma_1688_f32_tf32(acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1, acc[0], acc[1], acc[2], acc[3]);
 }
 
 __device__ __forceinline__ float quad_sum_f(float v) {
@@ -215,7 +211,7 @@ __global__ void __launch_bounds__(32 * kCdW) ctrl_down_prompt_kernel(const float
             const int r = q / (kCdK / 8), k8 = (q % (kCdK / 8)) * 8;
             cp16_cg(&ws[buf][r][k8], w_down + (size_t) min(nb + r, rank - 1) * w_ld + w_col0 + k0 + k8);
         }
-        asm volatile("cp.async.commit_group;\n" ::);
+        basalt::volta::cp_async_commit();
     };
 
     float acc_d[2][4] = {}, acc_m[2][4] = {};
@@ -226,9 +222,9 @@ __global__ void __launch_bounds__(32 * kCdW) ctrl_down_prompt_kernel(const float
         for (int kc = 0; kc < nkc; ++kc) {
             if (kc + 1 < nkc) {
                 load_stage((kc + 1) & 1, xsrc, w_col0, kc + 1);
-                asm volatile("cp.async.wait_group 1;\n" ::);
+                basalt::volta::cp_async_wait<1>();
             } else {
-                asm volatile("cp.async.wait_group 0;\n" ::);
+                basalt::volta::cp_async_wait<0>();
             }
             __syncthreads();
             const int buf = kc & 1;

@@ -912,6 +912,10 @@ __device__ __forceinline__ void mma884(float* c, uint32_t a0, uint32_t a1, uint3
 #endif
 }
 
+// (Lapilli, V100) the staging below sizes its 16-byte pieces from THESE element types, never from Basalt's
+// Smem<KV_MODE> above: since Basalt's Smem serves only the Q4_0 forms (its KElem is int8 and its VElem fp16 for every
+// other mode), the int8 KV's V rows were staged as fp16 (twice their bytes, over the next rows) and the fp16 KV's K rows
+// as int8 (half of each row): qsa_prompt_attn_parity, int8, error 5.9 at an output scale of 3.3.
 template <int KV_MODE>
 struct Smem70 {
     using KElem = typename std::conditional<KV_MODE == 0, __half, int8_t>::type;
@@ -1000,7 +1004,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
         // gather the chunk's K and V rows (16-byte pieces; K8V4's V as q4_0 blocks dequantized to fp16)
         // and their scales
         {
-            constexpr int KPIECES = HD * (int) sizeof(typename Smem<KV_MODE>::KElem) / 16;   // per K row
+            constexpr int KPIECES = HD * (int) sizeof(typename Smem70<KV_MODE>::KElem) / 16;   // per K row
             constexpr int KPT = (CH * KPIECES + THREADS - 1) / THREADS;
             static_assert((CH * KPIECES) % THREADS == 0, "the staging pieces divide evenly");
             // issue every global load of a thread before any of its stores: they then overlap each other instead
@@ -1043,7 +1047,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
                     }
                 }
             } else {
-                constexpr int VPIECES = HD * (int) sizeof(typename Smem<KV_MODE>::VElem) / 16;   // per V row
+                constexpr int VPIECES = HD * (int) sizeof(typename Smem70<KV_MODE>::VElem) / 16;   // per V row
                 constexpr int VPT = (CH * VPIECES + THREADS - 1) / THREADS;
                 static_assert((CH * VPIECES) % THREADS == 0, "the staging pieces divide evenly");
                 uint4 vx[VPT];

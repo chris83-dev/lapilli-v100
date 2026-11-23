@@ -1,6 +1,7 @@
 // basalt/models/qwen4exp/decode/expert_dispatch.hpp - the pool's side of a layer: its state and its entry points.
 #pragma once
 
+#include "basalt/core/expert_map.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"

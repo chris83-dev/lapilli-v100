@@ -1,7 +1,5 @@
 // include/basalt/core/expert_map.hpp - a fixed sample of a model's routed experts for the server's expert map: where
 // each one lives and how often decode looks it up.
-// Lapilli: taken from upstream Basalt (github.com/jesdga95/basalt, commit ff0b978d, MIT) for the expert map of the
-// server's console; unchanged.
 //
 // The sample is the same on every start of a pack (pair i sits at the middle of the i-th equal stretch of all
 // layer * n_expert pairs), so the map's cells keep their experts across restarts. Counting is a table read and an

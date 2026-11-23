@@ -9,6 +9,43 @@
 
 namespace basalt::models::qwen4exp::serve {
 
+int64_t QfnRuntime::gpu_slots() const {
+    int64_t n = xcache.slots();
+    for (const auto& st : stages) n += st->cache.slots();
+    if (peer.valid()) n += peer.cache().slots();
+    for (const auto& xpe : xpeers)
+        if (xpe->valid()) n += xpe->cache().slots();
+    return n;
+}
+
+// the main card (the caller's device) with its cache and the link the start probed, each layer split stage's card, each tier card
+// with its link when the prompt split probed it
+std::vector<QfnRuntime::CardFacts> QfnRuntime::card_facts() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    const auto link = [&](int d) {
+        for (const auto& ps : pstages) if (ps->dev == d) return ps->link_gbps;
+        return 0.0;
+    };
+    // a tier card holds experts only; the main card's KV: the solo session's and every slot session's cells as backed now
+    std::vector<const basalt::core::SessionState*> on_main{&ss};
+    if (!bslot_ss.empty())
+        for (const auto& sl : bslot_ss[0])
+            if (sl && std::find(on_main.begin(), on_main.end(), sl.get()) == on_main.end()) on_main.push_back(sl.get());
+    int64_t kv = 0;
+    for (const basalt::core::SessionState* s : on_main)
+        kv += (int64_t) basalt::core::session_kv_bytes_for(*s, basalt::core::session_kv_cells(*s));
+    std::vector<CardFacts> out{{dev, (int64_t) xcache.slots(), main_link_gbps, (uint64_t) xcache.mapped_bytes(), kv}};
+    for (const auto& st : stages)
+        out.push_back({st->dev, (int64_t) st->cache.slots(), link(st->dev), (uint64_t) st->cache.mapped_bytes(), -1});
+    if (peer.valid())
+        out.push_back({peer.device(), (int64_t) peer.cache().slots(), link(peer.device()), (uint64_t) peer.cache().mapped_bytes(), 0});
+    for (const auto& xpe : xpeers)
+        if (xpe->valid())
+            out.push_back({xpe->device(), (int64_t) xpe->cache().slots(), link(xpe->device()), (uint64_t) xpe->cache().mapped_bytes(), 0});
+    return out;
+}
+
 bool QfnRuntime::windows_in_flight() { return piped && pipe_inflight(); }
 bool QfnRuntime::next_batch_window() { return piped ? pump(true) : batch_step(); }
 // a request reads its prompt through every stage: the groups in flight finish first
@@ -125,11 +162,9 @@ void QfnRuntime::print_info() {
         // "Experts in VRAM" is every stage's cache, not one card's.  The caches hold disjoint pairs, so they add.
         const int64_t slots_primary = (int64_t) xcache.slots();
         const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
-        int64_t slots_all = slots_primary, mib_all = mib_primary;
-        for (const auto& st : stages) {
-            slots_all += (int64_t) st->cache.slots();
-            mib_all += (int64_t) (st->cache.bytes() >> 20);
-        }
+        const int64_t slots_all = gpu_slots();
+        int64_t mib_all = mib_primary;
+        for (const auto& st : stages) mib_all += (int64_t) (st->cache.bytes() >> 20);
         // the pack's quantization label (the last word of its name, without the publisher's prefixes) and the PCI
         // bus ids of the cards this engine computes on, primary first: what a benchmark row records
         std::string quant_label, gpu_ids;
@@ -147,7 +182,8 @@ void QfnRuntime::print_info() {
                     "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                     "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                     "conversation_cache_mib=%lld conversation_cache_slots=%d "
-                    "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%d tail_role_token=%lld vram_elastic=%d%s quant=%s gpus=%s engine=" BASALT_VERSION "\n",
+                    "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%d tail_role_token=%lld vram_elastic=%d%s quant=%s gpus=%s "
+                    "ram_experts_mib=%lld engine=" BASALT_VERSION "\n",
                     (long long) n_vocab, (long long) o.max_context, o.kv.c_str(),
                     (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                      ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -163,7 +199,10 @@ void QfnRuntime::print_info() {
                                    " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                    " slot0_solo=" + std::to_string(slot0_is_solo ? 1 : 0) +
                                    " solo_any_slot=" + std::to_string(slot0_is_solo ? 1 : 0)).c_str() : "",
-                    quant_label.c_str(), gpu_ids.c_str());
+                    quant_label.c_str(), gpu_ids.c_str(),
+                    // the experts held in RAM: the pinned copy, or the arena of all of them; none when the file's pages are read
+                    (long long) ((srcp == &src ? (src.complement_ready() ? src.resident_bytes() : 0)
+                                               : basalt::kernels::cpu::expert_layout().total) >> 20));
         // whether the in-engine encoder reads video (FFmpeg found at run time), for the server's start line
         if (o.vision_in_engine) std::printf("%s\n", basalt::vision::video_line().c_str());
     }

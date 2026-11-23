@@ -35,7 +35,7 @@ std::vector<ImgKey> Runtime::imgs_below(const std::vector<ImgKey>& all, int64_t 
 
 bool Runtime::batch_on() { for (const BSlot& b : bs) if (b.active) return true; return false; }
 
-// (Lapilli: as upstream Basalt's, commit ff0b978d, without its INFO cards= facts)
+// (Lapilli) upstream Basalt's, with the expert map at its own pace
 void Runtime::stats_tick(bool force, bool with_map) {
     const ConsoleStats::Clock::time_point now = ConsoleStats::Clock::now();
     if (!stats.due(now, force)) return;
@@ -51,6 +51,18 @@ void Runtime::stats_tick(bool force, bool with_map) {
             map_last_ = now;
             map_every_ = homes.size() > kMapEveryCells ? 2 * ConsoleStats::kEverySeconds : ConsoleStats::kEverySeconds;
         }
+    }
+    std::string cards;
+    for (const CardFacts& c : card_facts()) {
+        char bus[32] = {}, gbps[32] = "-";
+        if (cudaDeviceGetPCIBusId(bus, sizeof bus, c.device) != cudaSuccess) continue;
+        if (c.h2d_gbps > 0) std::snprintf(gbps, sizeof gbps, "%.1f", c.h2d_gbps);
+        cards += (cards.empty() ? "" : ";") + std::string(bus) + "/" + std::to_string(c.expert_slots) + "/" + gbps + "/" +
+                 std::to_string(c.expert_bytes >> 20) + "/" + (c.kv_bytes >= 0 ? std::to_string(c.kv_bytes >> 20) : "-");
+    }
+    if (!cards.empty() && cards != cards_sent_) {
+        cards_sent_ = cards;
+        out += "INFO cards=" + cards + "\n";
     }
     if (out.empty()) return;
     std::fputs(out.c_str(), stdout);
@@ -78,7 +90,7 @@ Flow Runtime::dispatch() {
         std::string pe;
         while (!got && (disk.enabled() || parking)) {
             const int r = next_line_within(line, 1000);
-            if (r < 0) return Flow::quit;
+            if (r < 0) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
             got = r == 1;
             while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
             if (got) break;
@@ -86,7 +98,7 @@ Flow Runtime::dispatch() {
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
             if (!parking) break;
         }
-        if (!got && !next_line(line)) return Flow::quit;
+        if (!got && !next_line(line)) { basalt::log::info("basalt serve", "input pipe closed"); return Flow::quit; }
     }
     // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
     // request's prompt and first token as a GEN 1, then continues it in that slot
@@ -123,6 +135,7 @@ Flow Runtime::dispatch() {
         else vram_command(line, verr, false);
         if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
         std::fflush(stdout);
+        stats_tick(true);   // the cards' expert slots moved
         return Flow::next;
     }
     // SLEEP / WAKE, between requests: the expert cache gives its VRAM back down to its smallest size (every
@@ -142,6 +155,16 @@ Flow Runtime::dispatch() {
         if (!down) basalt::platform::ram_guard_pause(false);
         if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
         std::fflush(stdout);
+        stats_tick(true);
+        return Flow::next;
+    }
+    if (line == "STATS") {   // the server's console: XSLOT and XMAP lines from now on (console_stats.hpp)
+        stats.on = true;
+        stats_tick(true);
+        return Flow::next;
+    }
+    if (line.rfind("PMATCH ", 0) == 0 || line.rfind("PFREE ", 0) == 0) {   // a prompt held by handle, between requests and windows
+        prompt_command(line);
         return Flow::next;
     }
     if (line.rfind("ERR_GENT ", 0) == 0) {

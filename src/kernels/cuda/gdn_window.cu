@@ -174,12 +174,24 @@ __device__ __forceinline__ void rec_sync() {
     else __syncthreads();
 }
 
+// Below sm_90 (a peer-tier build for an older card) the cluster machinery does not exist: only the SPLIT
+// instantiation is compiled there, where `cluster` is always null, so its type degenerates to void*.
+// (Lapilli) The V100 (sm_70) keeps the cluster code, through volta_compat.cuh's stand-ins (BASALT_CLUSTER_*: a cluster
+// kernel compiles there and stops at once); the host never launches one on it (dec_gdn_clusters picks the split path).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900 && __CUDA_ARCH__ != 700
+#define DM_REC_NO_CLUSTERS 1
+using DmRecClusterPtr = void*;
+#else
+#define DM_REC_NO_CLUSTERS 0
+using DmRecClusterPtr = BASALT_CLUSTER_T*;
+#endif
+
 // One block of a head's cluster.  `head` = the launch's value head (head_map), `rank` = its column group.  SPLIT: no cluster and no z; the
 // head's raw output goes to a.o for dec_gdn_rec_norm.  GIN (with SPLIT): the gates come computed, alpha of token t at
 // gin_a[t * h_v + gh] and beta at gin_b[t * h_v + gh] (dec_gdn_gates).
 template<int MAXT, int NJ, bool SPLIT, bool SUB = false, bool GIN = false>
 __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, int rank, RecSmem<NJ, rec_rows(MAXT)>& sm,
-                                          BASALT_CLUSTER_T* cluster, const float* gin_a = nullptr,
+                                          DmRecClusterPtr cluster, const float* gin_a = nullptr,
                                           const float* gin_b = nullptr) {
     const int rg = threadIdx.x / 32, lane = threadIdx.x % 32, tid = threadIdx.x;
     stamp(a, 0);
@@ -209,9 +221,10 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         basalt::volta::cp_async_cg16((uint32_t) __cvta_generic_to_shared(&sm.wab[r][k]), src);
     }
     basalt::volta::cp_async_commit();
-    const float dt = a.dt[gh], sa = a.ssm_a[gh], gam = a.gamma[col];
+    const float dt = a.dt[gh], sa = a.ssm_a[gh];
+    [[maybe_unused]] const float gam = a.gamma[col];   // read by the norm, which a build below sm_90 does not compile
     stamp(a, 1);
-    if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights
+    if (a.early_trigger) pdl_launch_dependents();   // the out projection may stage its weights (a no-op below sm_90)
     // alpha and beta read only the hc output and constants, both complete before this kernel can launch (its
     // predecessor passed its own wait on the hc read), so they are computed while the projections still run
     basalt::volta::cp_async_wait_all();
@@ -223,6 +236,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
             ab_pair<NJ>(a, sm.wab, t, lane, dt, sa, al, be);
             if (lane == 0) { sm.g[t] = al; sm.b[t] = be; }
         }
+#if !DM_REC_NO_CLUSTERS
     } else {   // a token per warp of the cluster, written into every rank's shared memory once all four have started
         BASALT_CLUSTER_ASM("barrier.cluster.arrive.relaxed.aligned;");
         BASALT_CLUSTER_ASM("barrier.cluster.wait.aligned;");
@@ -235,9 +249,12 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
             }
         }
         BASALT_CLUSTER_ASM("barrier.cluster.arrive.release.aligned;");   // waited on before the gates are read
+#endif
     }
     pdl_wait();
+#if !DM_REC_NO_CLUSTERS
     if constexpr (!SPLIT) BASALT_CLUSTER_ASM("barrier.cluster.wait.acquire.aligned;");
+#endif
     if constexpr (GIN) {   // thread t's gates, read by thread t and, past the barriers below, the block
         if (tid < T) { sm.g[tid] = gin_a[(size_t) tid * a.h_v + gh]; sm.b[tid] = gin_b[(size_t) tid * a.h_v + gh]; }
     }
@@ -361,6 +378,7 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
         }
     }
     if (SPLIT) return;
+#if !DM_REC_NO_CLUSTERS
     // every rank's sums of squares, pushed into every rank's shared memory (every rank has started: the gates' barrier)
     // before one cluster barrier
     if (rg == 0) {
@@ -385,14 +403,17 @@ __device__ __forceinline__ void rec_block(const DecRecArgs& a, int T, int head, 
     }
     stamp(a, 8);
     stamp(a, 9);
+#endif  // !DM_REC_NO_CLUSTERS
 }
 
+#if !DM_REC_NO_CLUSTERS
 template<int MAXT, int NJ>
 __global__ void BASALT_CLUSTER_DIMS(4, 1, 1) __launch_bounds__(S) rec_kernel(const DecRecArgs a, int T) {
     __shared__ RecSmem<NJ, rec_rows(MAXT)> sm;
     BASALT_CLUSTER_T cl = BASALT_THIS_CLUSTER();
     rec_block<MAXT, NJ, false>(a, T, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
+#endif  // !DM_REC_NO_CLUSTERS
 
 template<int MAXT, int NJ>
 __global__ void __launch_bounds__(S) rec_split_kernel(const DecRecArgs a, int T) {
@@ -426,6 +447,7 @@ __device__ __forceinline__ DecRecArgs seg_args(const DecRecArgs& a0, const SegRo
 
 // rec_kernel over a segmented window: cluster row y is a window row, of which only a segment's first works, on the
 // segment's rows and state
+#if !DM_REC_NO_CLUSTERS
 template<int MAXT, int NJ>
 __global__ void BASALT_CLUSTER_DIMS(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(const DecRecArgs a0, const SegRow* rows,
                                                                               size_t state_off, const SegDst* dst,
@@ -469,6 +491,7 @@ __global__ void __launch_bounds__(128) gates_kernel(const DecRecArgs a, int n_to
     ab_pair<NJ>(a, wab, t, lane, dt, sa, al, be);
     if (lane == 0) { gates[(size_t) t * a.h_v + gh] = al; gates[((size_t) n_tok + t) * a.h_v + gh] = be; }
 }
+#endif  // !DM_REC_NO_CLUSTERS
 
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
 __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T) {

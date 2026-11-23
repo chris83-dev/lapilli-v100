@@ -17,7 +17,6 @@
 #include <cstdint>
 
 #include "basalt/kernels/gdn_window.hpp"
-#include "basalt/models/qwen4exp/kernels/resident_tabs.hpp"
 
 namespace basalt::kernels {
 
@@ -97,12 +96,6 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0);
-/// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
-/// outstanding at once (the split verify window keeps two).
-void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
-/// Sets *flag = value (a mapped host flag) behind everything queued on the stream, written out to the system first: the
-/// other end of a wait_flag_ge on another device.
-void signal_flag(uint32_t* flag, uint32_t value, void* stream);
 /// Up to kWordCopyMax disjoint device word ranges copied by one launch (the pipelined pair's state snapshot).
 constexpr int kWordCopyMax = 32;
 struct WordCopy {
@@ -117,13 +110,6 @@ struct WordCopyList {
 void word_copy_list(const WordCopyList& l, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
-
-// ---- route tail skip (opt-in, changes the output)
-/// An entry whose expert no GPU holds and that every entry naming that expert ranks `rank` or lower by router weight in
-/// its token (0-based, of k) gets id -1 and weight 0; the other weights are kept. n_entries <= 128.
-/// counts (device, optional): [0] entries, [1] entries no GPU holds, [2] entries dropped (added to).
-void route_tail_skip(int32_t* ids, float* weights, const ResidentTabs& held, int n_entries, int k, int rank, int n_expert,
-                     unsigned long long* counts, void* stream);
 
 // ---- a layer whose routed experts are all in VRAM needs nothing from the host
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's

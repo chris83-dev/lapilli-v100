@@ -7,14 +7,14 @@
         the expert map's sample: one home digit per sampled expert (0 VRAM, 1 peer card, 2 RAM, 3 file) and its
         lookups since the last XMAP line
 """
-# Lapilli: the XSLOT/XMAP part of upstream Basalt's serve/engine/console.py (github.com/jesdga95/basalt, commit ff0b978d,
-# MIT), unchanged but for parse_xmap's total (read inside its try) and the per-line sums of _map (for summary()); its
-# INFO cards=/cpu_l3= readers are left out (this engine does not send them).  Added below the upstream part:
+# Lapilli: upstream Basalt's serve/engine/console.py (github.com/jesdga95/basalt, MIT), but for parse_xmap's total (read
+# inside its try) and the per-line sums of _map (for summary()).  Added below the upstream part: summary() and
 # expert_tiers(), the occupancy words of the engines (INFO expert_tiers= per layer, or expert_tiers_total= for a pool).
 
 from __future__ import annotations
 
 import collections
+import re
 import threading
 import time
 
@@ -246,3 +246,76 @@ def expert_tiers(info: dict) -> dict | None:
         return None
     return {"layers": layers, "per_layer": per_layer, "main_copies": info.get("main_copies") == 1, "pool": not par_couche,
             "tiers": tiers}
+
+def norm_bus(bus) -> str:
+    """A PCI address as domain:bus:device.function in plain hex, so NVML's and CUDA's spellings compare equal."""
+    m = re.fullmatch(r"([0-9a-fA-F]+):([0-9a-fA-F]+):([0-9a-fA-F]+)\.([0-7])", str(bus or "").strip())
+    return ":".join(f"{int(x, 16):x}" for x in m.groups()[:3]) + "." + m.group(4) if m else ""
+
+
+def parse_cards(words) -> dict[str, dict]:
+    """INFO cards=<bus>/<expert slots>/<GB/s or ->/<expert MiB>/<KV MiB or ->;... as
+    {bus: {expert_slots, h2d_gbps, experts, kv}} (experts and kv in bytes; kv None when the engine does not say)."""
+    out = {}
+    for part in str(words or "").split(";"):
+        f = part.split("/")
+        if len(f) != 5:
+            continue
+        try:
+            out[norm_bus(f[0])] = {"expert_slots": int(f[1]), "h2d_gbps": None if f[2] == "-" else float(f[2]),
+                                   "experts": int(f[3]) << 20, "kv": None if f[4] == "-" else int(f[4]) << 20}
+        except ValueError:
+            continue
+    return out
+
+
+def parse_l3(words) -> list[list[int]]:
+    """INFO cpu_l3=0-7,16-23;8-15,24-31 as the logical processors of each L3 cache."""
+    groups = []
+    for part in str(words or "").split(";"):
+        g = []
+        for r in part.split(","):
+            lo, _, hi = r.partition("-")
+            if lo.isdigit() and (not hi or hi.isdigit()):
+                g.extend(range(int(lo), int(hi or lo) + 1))
+        if g:
+            groups.append(g)
+    return groups
+
+
+def engine_facts(info: dict) -> tuple[dict, list[list[int]]]:
+    """Takes the per-card and CPU words out of the engine's INFO facts; with cards, the engine's expert slots are
+    their sum, the one count every view shows."""
+    cards = parse_cards(info.pop("cards", None))
+    l3 = parse_l3(info.pop("cpu_l3", None))
+    if cards:
+        info["expert_slots"] = sum(c["expert_slots"] for c in cards.values())
+    return cards, l3
+
+
+def hardware_view(now: dict, static: dict, info: dict, cards: dict, l3: list[list[int]]) -> dict:
+    """The sampler's reading with what needs the engine: each card's experts, measured link and VRAM split (the expert
+    slots, the KV cache when the engine says, and the rest of what is in use: weights, workspaces, other processes), the
+    load of each L3 group of processors (a CCD), and RAM split into the engine's expert tier, the page cache and the rest."""
+    hw = dict(now)
+    bus = {g.get("index"): norm_bus(g.get("bus")) for g in static.get("gpus") or []}
+    gpus = []
+    for g in hw.get("gpus") or []:
+        c = cards.get(bus.get(g.get("index")), {})
+        used, parts = g.get("mem_used"), None
+        if c and isinstance(used, int):
+            kv = c["kv"] or 0
+            parts = {"experts": c["experts"], "kv": c["kv"], "other": max(0, used - c["experts"] - kv)}
+        gpus.append({**g, "expert_slots": c.get("expert_slots"), "h2d_gbps": c.get("h2d_gbps"), "vram_parts": parts})
+    hw["gpus"] = gpus
+    cores = hw.pop("cpu_cores", None)
+    hw["cpu_ccd"] = None
+    if cores and len(l3) > 1:
+        loads = [[cores[i] for i in g if i < len(cores)] for g in l3]
+        hw["cpu_ccd"] = [round(sum(v) / len(v), 1) if v else None for v in loads]
+    cached, used = hw.pop("ram_cached", None), hw.get("ram_used")
+    hw["ram_parts"] = None
+    if isinstance(cached, int) and isinstance(used, int):
+        experts = min(used, int(info.get("ram_experts_mib") or 0) << 20)
+        hw["ram_parts"] = {"experts": experts, "page_cache": cached, "other": used - experts}
+    return hw

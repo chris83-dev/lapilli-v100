@@ -26,8 +26,8 @@
 #include "basalt/ggml/ggml_common.h"
 #include "basalt/kernels/volta_compat.cuh"
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200 && __CUDA_ARCH__ != 700   // 700: also allowed, for Volta
-#error "the MMQ kernels are built for compute capability 12.0 only"
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890 && __CUDA_ARCH__ != 700   // 700: also allowed, for Volta (Lapilli)
+#error "the MMQ kernels are built for compute capability 7.0 (the V100), 8.9 (an Ada peer) and 12.0 only"
 #endif
 
 #define WARP_SIZE 32
@@ -78,12 +78,18 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 }
 
 // Programmatic dependent launch: a kernel waits for its predecessor, or signals that the next may start.
+// Below sm_90 (an Ada peer tier) the intrinsics lower to griddepcontrol, which does not exist there: both
+// become no-ops and the host side launches these kernels the plain way.
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
-    basalt::volta::griddep_wait();
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
 }
 
 static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
-    basalt::volta::griddep_launch_dependents();
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 // Kernels that use programmatic dependent launch take no __restrict__ pointers.

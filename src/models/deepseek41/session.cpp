@@ -39,7 +39,21 @@
 namespace basalt::models::deepseek41 {
 namespace {
 constexpr int kLendTierTokens = 4096;   // a prompt this long reads without the VRAM tier, in larger chunks
-constexpr int kStepTailTokens = 16;     // a tail shorter than this reads one decode step at a time when no workspaces fit
+// (Lapilli) BASALT_DS_STEP_TAIL=N: a fresh prompt shorter than N tokens reads one decode step at a time when no workspaces fit;
+// a longer one borrows the whole VRAM tier (the DeepSeek's tier lends no part of it) and gets it back empty, so the answer
+// after it refills the main card's copies one miss at a time. #327 (upstream) took N from 257 (v0.5) to 16. Unset: 160, the
+// crossover measured on 2x V100 (a fresh prompt then 256 tokens, medians of 3, two runs): 56 tokens 5.3 s stepped
+// against 6.6 s lent, 114 tokens 6.3 against 6.6 to 7.0 s, 196 tokens 7.6 against 7.0 to 7.3 s (stepping 18.5 ms a token,
+// lending 1.2 s plus ~5 ms a token plus ~1 s of refill in the answer)
+constexpr int kStepTailV100 = 160;
+inline int step_tail_tokens() {
+    static const int n = [] {
+        const char* e = std::getenv("BASALT_DS_STEP_TAIL");
+        const int v = e ? std::atoi(e) : 0;
+        return v > 0 ? v : kStepTailV100;
+    }();
+    return n;
+}
 
 #define DS_CUDA(call)                                                                                   \
     do {                                                                                                \
@@ -288,13 +302,14 @@ public:
                 open_prompt_path(plan_tokens);
                 if (plan_tokens >= kLendTierTokens) {
                     std::string te;
+                    if (fit_trace()) basalt::log::info("basalt deepseek41", "fit trace: %d tokens (long) lend the VRAM tier", plan_tokens);
                     if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
                 }
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
                 if (!prefill_ && !make_prefill_fit(plan_tokens, err)) {
                     // a long context's caches left no room: a short tail (< 16 tokens) takes the decode path, a longer read the tier's memory
-                    if (r.n_tokens < kStepTailTokens) {
+                    if (r.n_tokens < step_tail_tokens()) {
                         close_prompt_path();
                         for (int i = 0; i < r.n_tokens; ++i)
                             if (!step(r.tokens + i, 1, r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
@@ -303,6 +318,7 @@ public:
                     std::string te;
                     err.clear();
                     short_prompt_ = false;
+                    if (fit_trace()) basalt::log::info("basalt deepseek41", "fit trace: %d tokens lend the VRAM tier", plan_tokens);
                     if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
                     if (!make_prefill_fit(plan_tokens, err)) return prompt_failed(err);
                 }
@@ -360,6 +376,7 @@ public:
         cudaStreamSynchronize(stream_);
         release_short_prompt();
         if (low) {
+            if (fit_trace()) basalt::log::info("basalt deepseek41", "fit trace: low memory lends the VRAM tier");
             t->lend_all();
         } else {
             if (!t->reclaim(e)) return {model::Status::Error, e};
@@ -515,6 +532,7 @@ public:
         const auto lend = [&] {
             if (!t) return false;
             cudaStreamSynchronize(stream_);
+            if (fit_trace()) basalt::log::info("basalt deepseek41", "fit trace: the pictures lend the VRAM tier");
             t->lend_all();
             return true;
         };
@@ -582,6 +600,7 @@ public:
             std::string te;
             err.clear();
             short_prompt_ = false;
+            if (fit_trace()) basalt::log::info("basalt deepseek41", "fit trace: %d rows (images) lend the VRAM tier", n_rows);
             if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
             if (!make_prefill_fit(n_rows, err)) return prompt_failed(err);
         }
@@ -690,6 +709,11 @@ private:
     // which it gives back before the next prompt allocates them again.
     // The prompt workspaces for the largest chunk the free memory carries (a long context's caches have taken part of
     // the card). The estimate picks the first size to try, and the free memory left after the allocation confirms it.
+    // (Lapilli, diagnostic) BASALT_DS_FIT_TRACE=1: each fit of the prompt workspaces and each lend of the tier in the log
+    static bool fit_trace() {
+        static const bool on = [] { const char* e = std::getenv("BASALT_DS_FIT_TRACE"); return e && e[0] == '1'; }();
+        return on;
+    }
     bool make_prefill_fit(int tokens, std::string& err) {
         const prefillp::Dims d = m_.prompt_dims();
         uint64_t free_b = 0, total_b = 0;
@@ -705,6 +729,10 @@ private:
         const uint64_t margin = std::max(beside ? prefillp::kShortMargin : prefillp::kMargin, tier ? tier->free_floor() : 0);
         if (beside) tokens = prefillp::kShortChunk;   // these workspaces stay for the next short read, whatever its size
         const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, margin, tokens);
+        if (fit_trace())
+            basalt::log::info("basalt deepseek41", "fit trace: %d tokens%s, %llu MiB free, margin %llu MiB, plan chunk %d%s%s", tokens,
+                              beside ? " (short, beside the copies)" : "", (unsigned long long) (free_b >> 20),
+                              (unsigned long long) (margin >> 20), fit.chunk, fit.chunk ? "" : ": ", fit.error.c_str());
         if (!fit.chunk) {
             err = "deepseek41: " + fit.error;
             return false;
@@ -713,6 +741,13 @@ private:
             std::string e;
             prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
             const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
+            if (fit_trace()) {
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                basalt::log::info("basalt deepseek41", "fit trace: chunk %d %s, %llu MiB free after, %llu MiB wanted%s%s", cap,
+                                  prefill_ ? "made" : "not made", (unsigned long long) (fb >> 20), (unsigned long long) (after >> 20),
+                                  e.empty() ? "" : ": ", e.c_str());
+            }
             if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
                 cudaGetLastError();   // a larger size that did not fit left its error behind
                 return true;

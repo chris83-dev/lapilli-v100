@@ -44,15 +44,8 @@ constexpr int kPrefillRingDeep = 384;
 constexpr int64_t kDeepRingTokens = 16384;
 extern int g_ring_depth;
 bool fused_ring();
-// BASALT_COPY_AHEAD=0 turns off the next layer's routing guess and the copies ahead of it (ahead.cpp), =1 forces them;
-// unset, off on a Volta card (sm_70 to sm_74, the current card at the first call: the primary), where the attention's
-// kernels run 2 to 3 times slower beside those copies (measured on 2x V100), on elsewhere
-inline bool copy_ahead_on() {
-    static const int env = [] {
-        const char* e = std::getenv("BASALT_COPY_AHEAD");
-        return e == nullptr ? -1 : (e[0] == '0' ? 0 : 1);
-    }();
-    if (env >= 0) return env == 1;
+// (Lapilli) the current card at the first call (the primary) is a Volta one, sm_70 to sm_74
+inline bool volta_primary() {
     static const bool volta = [] {
         int dev = 0, major = 0, minor = 0;
         if (cudaGetDevice(&dev) != cudaSuccess ||
@@ -64,7 +57,30 @@ inline bool copy_ahead_on() {
         const int c = 10 * major + minor;
         return c >= 70 && c < 75;
     }();
-    return !volta;
+    return volta;
+}
+// BASALT_COPY_AHEAD=0 turns off the next layer's routing guess and the copies ahead of it (ahead.cpp), =1 forces them;
+// unset, off on a Volta card (volta_primary), where the attention's kernels run 2 to 3 times slower beside those copies
+// (measured on 2x V100), on elsewhere
+inline bool copy_ahead_on() {
+    static const int env = [] {
+        const char* e = std::getenv("BASALT_COPY_AHEAD");
+        return e == nullptr ? -1 : (e[0] == '0' ? 0 : 1);
+    }();
+    if (env >= 0) return env == 1;
+    return !volta_primary();
+}
+// (Lapilli) BASALT_PINNED_SKIP=0 turns off the skip of a prompt chunk's unused pinned expert copies (#489: the copy
+// issuer waits on the host for each reused ring slot, then reads the layer's routing counts), =1 forces it; unset, off
+// on a Volta card (volta_primary), on elsewhere. Flash-Next's prompt read on 2x V100, five runs alternated: at
+// 16K the skip reads 1 386 / 1 389 tokens/s, without it 1 449 / 1 449 (v0.5 1 449); from 3K to 8K it gains 0.3 to 0.6 %
+inline bool pinned_skip_on() {
+    static const int env = [] {
+        const char* e = std::getenv("BASALT_PINNED_SKIP");
+        return e == nullptr ? -1 : (e[0] == '0' ? 0 : 1);
+    }();
+    if (env >= 0) return env == 1;
+    return !volta_primary();
 }
 // A routed chunk of at least this many tokens sends the peer's activations right after up_mix (it waits for the peer), a
 // smaller one behind the routing's copy (it waits for the main card's own experts); BASALT_PEER_EARLY_UPMIX_MIN, default 2560

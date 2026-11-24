@@ -34,7 +34,8 @@ bool Prefill::Run::Chunk::publish_route(int64_t layer) {
 }
 
 bool Prefill::Run::Chunk::start_stream() {
-    if (stream_all && first_stage && single_chunk && LB == 0 && LE == g.n_layers && !ppc && m.hist_on) {
+    if (stream_all && first_stage && single_chunk && LB == 0 && LE == g.n_layers && !ppc && m.hist_on &&
+        pinned_skip_on()) {
         const size_t bytes = (size_t) g.n_layers * g.n_expert * sizeof(uint32_t);
         route_snapshot.stream = cs;
         uint32_t* counts = nullptr;

@@ -1,6 +1,7 @@
 // src/models/hy4flash/kernels/ops.cu - the sigmoid gate, small products, the stream fill and the Engram apply of
 // Hy4-flash.
 #include "basalt/models/hy4flash/kernels.hpp"
+#include "basalt/kernels/volta_compat.cuh"   // (Lapilli) the V100's equivalents of mma.sync, ldmatrix, the L2 prefetch
 
 #include <cuda_runtime.h>
 
@@ -96,7 +97,7 @@ __device__ void l2_read_ahead_block(const L2Ranges& r, uint32_t* mark, uint32_t 
             }
             const uint64_t take = min(min(o1 - o, r.n[i] - ro), (uint64_t) 32768);
             const char* src = (const char*) r.p[i] + ro;
-            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"((unsigned) take) : "memory");
+            basalt::volta::bulk_prefetch_l2(src, (unsigned) take);   // (Lapilli) a no-op on the V100
             last = src + take - 16;
             o += take;
         }
@@ -132,11 +133,15 @@ __global__ void swiglu_split_kernel(const float* __restrict__ gu, float* __restr
 }
 
 __global__ void wsum_tokens_kernel(const float* __restrict__ rows, const int32_t* __restrict__ map, const float* __restrict__ w, int K, int n,
-                                   float* __restrict__ out) {
+                                   float* __restrict__ out, const float* __restrict__ extra) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (i >= n) return;
     float acc = 0.f;
-    for (int k = 0; k < K; ++k) acc += w[t * K + k] * rows[(size_t) map[t * K + k] * n + i];
+    for (int k = 0; k < K; ++k) {
+        const int32_t m = map[t * K + k];
+        if (m >= 0) acc += w[t * K + k] * rows[(size_t) m * n + i];   // (Lapilli) -1: the pair is in `extra`
+    }
+    if (extra) acc += extra[(size_t) t * n + i];   // (Lapilli) the second card's rows of the token, already weighted and summed
     out[(size_t) t * n + i] = acc;
 }
 
@@ -317,8 +322,9 @@ void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, flo
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 
-void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, int n_tok, int K, int n, float* out, void* stream) {
-    wsum_tokens_kernel<<<dim3((n + 255) / 256, n_tok), 256, 0, (cudaStream_t) stream>>>(rows, map, w, K, n, out);
+void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, int n_tok, int K, int n, float* out, void* stream,
+                         const float* extra) {
+    wsum_tokens_kernel<<<dim3((n + 255) / 256, n_tok), 256, 0, (cudaStream_t) stream>>>(rows, map, w, K, n, out, extra);
     if (!stream) cudaStreamSynchronize(nullptr);
 }
 

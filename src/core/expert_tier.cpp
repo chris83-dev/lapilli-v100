@@ -295,6 +295,9 @@ bool ExpertTier::open_share(size_t card, std::string& err) {
     d.max_tokens = s_.share_max_tokens;
     d.max_rows = (int64_t) s_.share_max_tokens * s_.top_k;
     d.n_expert = n_expert_;
+    d.combine = s_.share_combine;   // (Lapilli) the model asks for one summed row per token
+    d.sums16 = d.combine && s_.share_sums16;
+    d.acc_fused = d.combine;
     int main_dev = 0;
     cudaGetDevice(&main_dev);
     // the share runs on the card that holds the block's homes: start_peer hands it device pointers into that card's slots

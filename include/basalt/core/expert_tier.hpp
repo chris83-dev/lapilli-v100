@@ -93,6 +93,9 @@ struct ExpertTierSpec {
     int ring_pieces = 0;
     uint64_t share_stride = 0;   ///< bytes between experts in a second card's prompt staging (the largest layer's)
     int share_max_tokens = 0;    ///< most tokens of a prompt chunk
+    /// (Lapilli) the second card's prompt share sends one row per token, the sum of its rows times their weights
+    /// (prefill::PeerShare::Dims::combine), not one row per (token, expert) pair; `share_sums16`: as FP16 rows
+    bool share_combine = false, share_sums16 = false;
     /// --route-tail-skip R and --route-prior LAMBDA (basalt/model/route_flags.hpp; 0 = off): the tier keeps the device
     /// table of the experts the GPUs hold that the model's decode windows route with (ExpertTier::publish_held).
     int route_tail_skip = 0;

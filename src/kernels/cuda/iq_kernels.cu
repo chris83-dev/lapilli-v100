@@ -1695,6 +1695,14 @@ constexpr int GRP_NC = 6;
 // 123.4 / 297.2, down at 1 136.9 / 334.5. The defaults by format: gate/up 4 (NVFP4) or 2 (Q8_0), down 2 or 1. BASALT_EXPERTS_MINB="g,d" sets both formats: g 1 to 4 (1: gate/up's original bounds), d 0 to 4 (0: down's
 // original bounds, none); "1,0" is the code before. native_grouped_set_minb chooses for tests.
 int g_minb_gu = 0, g_minb_down = 0;   // 0: as the environment says
+// (Lapilli, V100) gate/up at n_embd 1536 (Hy4-flash's latent) on the unrolled row, as at 2304: NVFP4 rows of 96 calls, Q8_0 of
+// 192, every weight load of a lane issued before its first dot (the same calls in the same order: the same bits).
+// BASALT_EXPERTS_U1536=0 keeps the generic row; native_grouped_set_unroll1536: 0 as the environment says, 1 off, 2 on (tests)
+int g_u1536 = 0;
+bool unroll1536_on() {
+    static const bool env_on = [] { const char* e = std::getenv("BASALT_EXPERTS_U1536"); return !(e && e[0] == '0' && e[1] == 0); }();
+    return g_u1536 == 0 ? env_on : g_u1536 == 2;
+}
 int experts_minb(bool down, int type) {
     static int env[2] = {-1, -1};
     if (env[0] < 0) {
@@ -2285,7 +2293,8 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
 
 // native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent - the
 // block's first group's weight rows are prefetched into L2 before the wait (and, for IQ4_NL, loaded into registers).
-template<int TD, bool DEP = false, int MINB = 1>   // MINB blocks per SM at least
+// KC > 0 (Lapilli): a down row is KC calls (row_dot_multi's unrolled row; n_ff 1536, Hy4-flash's latent): the same bits
+template<int TD, bool DEP = false, int MINB = 1, int KC = 0>   // MINB blocks per SM at least
 __global__ void __launch_bounds__(256, MINB) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
@@ -2477,7 +2486,7 @@ __global__ void __launch_bounds__(256, MINB) native_down_multi_kernel(const unsi
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
                 float s[GRP_NC];
-                row_dot_multi<TD, GRP_NC>(wr, hq, off, n, nb, lane, s);
+                row_dot_multi<TD, GRP_NC, false, false, KC>(wr, hq, off, n, nb, lane, s);
                 tail_scale<TD>(s, sc);
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c)
@@ -3269,6 +3278,18 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
             return;
         }
     }
+    if constexpr (TG == 40 || TG == 8) {   // (Lapilli) n_embd 1536 (NVFP4 rows of 96 calls, Q8_0 of 192): the unrolled row
+        constexpr int kc6 = TG == 40 ? 96 : 192;
+        if (!g_old_kernels && L.n_embd == 1536 && (int) (L.n_embd / Fmt<TG>::qk) * Fmt<TG>::ipb == kc6 && unroll1536_on()) {
+            switch (experts_minb(false, TG)) {
+            case 2: native_gu_multi_kernel<TG, false, kc6, 2><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+            case 3: native_gu_multi_kernel<TG, false, kc6, 3><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+            case 4: native_gu_multi_kernel<TG, false, kc6, 4><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+            default: native_gu_multi_kernel<TG, false, kc6><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+            }
+            return;
+        }
+    }
     if constexpr (TG == 40 || TG == 8 || TG == 46) {   // n_embd 2304 (NVFP4 rows of 144 calls, Q8_0 of 288): the unrolled row
         constexpr int kc = TG == 40 ? 144 : 288;
         if (!g_old_kernels && L.n_embd == 2304) {
@@ -3325,6 +3346,16 @@ bool down_sub8(const NativeExpertLayout& L) {
     else return L.n_ff % Fmt<TD>::qk == 0 && (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb == kDownSub8Calls;
 }
 
+// (Lapilli) the down rows at n_ff 1536 on the unrolled row (NVFP4 96 calls, Q8_0 192), as the gate/up rows at n_embd 1536
+template<int TD> bool down_u1536_ok(const NativeExpertLayout& L) {
+    if constexpr (TD == 40 || TD == 8) {
+        constexpr int kc6 = TD == 40 ? 96 : 192;
+        return !g_grouped_v1 && L.n_ff == 1536 && (int) (L.n_ff / Fmt<TD>::qk) * Fmt<TD>::ipb == kc6 && unroll1536_on();
+    } else {
+        return false;
+    }
+}
+
 template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
@@ -3350,6 +3381,23 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
         if (!done) {   // the original launch bounds
             if (dep) launch_dependent(native_down_sub8_kernel<TD, true>, g8, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
             else native_down_sub8_kernel<TD><<<g8, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        }
+    }
+    else if (down_u1536_ok<TD>(L)) {   // (Lapilli) n_ff 1536: the unrolled row, at the bounds below (the same bits)
+        if constexpr (TD == 40 || TD == 8) {
+            constexpr int kc6 = TD == 40 ? 96 : 192;
+            const int lb = exp_lb_level();
+            if (dep) {
+                if (lb == 3) launch_dependent(native_down_multi_kernel<TD, true, 4, kc6>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                else if (lb >= 1) launch_dependent(native_down_multi_kernel<TD, true, 3, kc6>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                else launch_dependent(native_down_multi_kernel<TD, true, 1, kc6>, grid, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            } else if (lb == 3) {
+                native_down_multi_kernel<TD, false, 4, kc6><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            } else if (lb >= 1) {
+                native_down_multi_kernel<TD, false, 3, kc6><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            } else {
+                native_down_multi_kernel<TD, false, 1, kc6><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            }
         }
     }
     else if (dep) {   // BASALT_EXP_LB >= 1: the down kernel at 3 blocks per SM (at 4 for level 3)
@@ -3531,6 +3579,7 @@ void native_expert_set_mode(int mode, int phase) {
 }
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+void native_grouped_set_unroll1536(int mode) { g_u1536 = mode; }
 void native_grouped_set_minb(int gu, int down) {   // gu 1..4, down 0..4 (0: its original bounds); gu 0: as the environment says
     g_minb_gu = gu;
     g_minb_down = gu == 0 ? 0 : down + 10;

@@ -2,6 +2,7 @@
 // the keys of 4 positions, the rotation of the indexer's heads, the relu score of every pooled key and the selection of
 // the best pools.
 #include "basalt/models/hy4flash/kernels.hpp"
+#include "basalt/kernels/volta_compat.cuh"   // (Lapilli) the V100's equivalents of mma.sync, ldmatrix, the L2 prefetch
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -109,9 +110,9 @@ __global__ void scores_kernel(const float* __restrict__ q, const float* __restri
 
 // Tensor-core scores of a row (16 heads, dim 128): S = Q K^T per 8 pooled keys on mma.m16n8k16 with q split into an fp16 high and low
 // part (the keys are fp16 already), then sum_h w_h relu(S_h). A block of 4 warps takes 512 pools of a row (blockIdx.y), a warp 128.
+// (Lapilli) through volta_compat.cuh: the same asm above Volta, its equivalent on the V100
 __device__ __forceinline__ void mma_f16(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f32_f16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1, c[0], c[1], c[2], c[3]);
 }
 
 __global__ void __launch_bounds__(128) scores_mma_kernel(const float* __restrict__ q, const float* __restrict__ w, const __half* __restrict__ pooled,

@@ -64,6 +64,12 @@ struct RowSpans {
 /// head group; a BF16 cache with more rows (a prompt's chunk) takes the tensor-core kernel. `work`: mla_attend_work_bytes for calls of
 /// up to max_rows rows, zeroed once before its first use (the launches leave it so).
 size_t mla_attend_work_bytes(int heads, int max_cells, int max_rows);
+/// (Lapilli, V100) the prompt chunks' attention on the V100's tensor cores (attend_mma_v70_kernel) or the emulated kernel: 0 as
+/// BASALT_HY4_ATTN_V70 says (on unless =0), 1 the emulated kernel, 2 the V100's (tests).
+void mla_attend_v70_mode(int mode);
+/// (Lapilli, tests) the heads a block of a window's attention takes (attend_kernel): 8 or 16 (the same bits), 0 the rule
+/// (on a V100 8; elsewhere 8 while the launch fits one block per SM, else 16; BASALT_HY4_ATT_HB=8|16 forces it)
+void mla_attend_heads_per_block(int hb);
 void mla_attend(const float* qcur, const float* cache, const RowSpans& r, int n_tok, const float* sinks, const MlaArgs& a, int ring,
                 int max_cells, void* work, float* o_lat, void* stream);
 /// The same over an fp16 cache.
@@ -178,7 +184,10 @@ struct ExpertTails {
 void swiglu_split_clamped(const float* gu, float* h, int64_t rows, int n_ff, float limit, void* stream,
                           const ExpertTails* tails = nullptr);
 /// out[t][i] = sum_k w[t * K + k] * rows[map[t * K + k]][i] for k < K, in that order.
-void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, int n_tok, int K, int n, float* out, void* stream);
+/// (Lapilli) a pair whose map entry is -1 is left out; `extra` (n_tok x n rows, or null) is added to each token's sum: the second
+/// card's rows of the token, weighted and summed there (prefill::PeerShare::Dims::combine)
+void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, int n_tok, int K, int n, float* out, void* stream,
+                         const float* extra = nullptr);
 
 // ---- hyper-connection streams -------------------------------------------------------------------------------------
 

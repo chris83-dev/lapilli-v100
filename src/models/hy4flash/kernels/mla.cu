@@ -3,13 +3,16 @@
 // result does not depend on the other rows or on how many there are.
 #include "basalt/kernels/mqa_chunk.cuh"
 #include "basalt/models/hy4flash/kernels.hpp"
+#include "basalt/kernels/volta_compat.cuh"   // (Lapilli) the V100's equivalents of mma.sync, ldmatrix, the L2 prefetch
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <mma.h>   // (Lapilli) nvcuda::wmma, the V100's tensor cores
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -443,15 +446,15 @@ __global__ void __launch_bounds__(mqa::kThreads) attend_kernel(const float* __re
 // fp16, accumulated in fp32, as llama.cpp's flash attention does. The softmax is a running one, the sink its first element.
 constexpr int kMmaCells = 32, kLd = 584, kPLd = 40;   // smem row strides in fp16 elements (avoid bank conflicts)
 
+// (Lapilli) ldmatrix and mma.sync through volta_compat.cuh: the same asm above Volta, their equivalents on the V100
 __device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((uint32_t) __cvta_generic_to_shared(p)));
+    basalt::volta::ldmatrix_s<4, false>(r, (unsigned) __cvta_generic_to_shared(p));
 }
 __device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const void* p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"((uint32_t) __cvta_generic_to_shared(p)));
+    basalt::volta::ldmatrix_s<4, true>(r, (unsigned) __cvta_generic_to_shared(p));
 }
 __device__ __forceinline__ void mma16816h(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    basalt::volta::mma_16816_f32_f16(c[0], c[1], c[2], c[3], a[0], a[1], a[2], a[3], b0, b1, c[0], c[1], c[2], c[3]);
 }
 __device__ __forceinline__ uint32_t bf2_to_h2(uint32_t v) {
     const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
@@ -639,6 +642,182 @@ __global__ void __launch_bounds__(256) attend_mma_kernel(const float* __restrict
 }
 
 
+// (Lapilli, V100) attend_mma_v70_kernel: attend_mma_kernel's steps (the same blocks of one row and 16 G heads, the same tiles of
+// 32 cells loaded a tile ahead, the same running softmax with the sink as its first element) on nvcuda::wmma 16x16x16 (fp16 in,
+// fp32 accumulate), the V100's own tensor cores, where the m16n8k16 mma and ldmatrix above are emulated with shuffles and FMAs
+// (14 % of a 16K prompt's GPU time on two V100s). S's partial sums go through shared memory as the emulated kernel's do
+// (G = 2: the two halves of the 576 dimensions; G = 1: four quarters, a warp then takes 16 cells and not 8), summed in a fixed
+// order; O stays in the warps' accumulator fragments, rescaled per head through Volta's measured accumulator layout (gqa_attn.cu,
+// for the 27B): element e of a lane is row r0 + (e & 2), column 8 ((lane >> 3) & 1) + 4 (e >> 2) + (lane & 2) + (e & 1), with
+// r0 = (lane & 1) + 8 ((lane >> 2) & 1) + 4 ((lane >> 4) & 1). Another rounding than the emulated kernel (the tensor cores' order
+// of a 16-deep product); a block still reads one row alone, so a row's bits do not depend on the chunk it is read in.
+namespace wmma = nvcuda::wmma;
+template <int G> __host__ __device__ constexpr int v70_parts() { return G == 2 ? 2 : 4; }
+template <int G> constexpr size_t mma_smem_v70() {
+    return (size_t) (16 * G * kLd + kMmaCells * kLd + 16 * G * kPLd) * 2 + ((size_t) v70_parts<G>() * 16 * G * 32 + 2 * 16 * G) * sizeof(float);
+}
+__device__ __forceinline__ int acc_row70(int lane, int e) { return (lane & 1) + 8 * ((lane >> 2) & 1) + 4 * ((lane >> 4) & 1) + (e & 2); }
+__device__ __forceinline__ int acc_col70(int lane, int e) { return 8 * ((lane >> 3) & 1) + 4 * (e >> 2) + (lane & 2) + (e & 1); }
+
+template <typename C, int G>
+__global__ void __launch_bounds__(256) attend_mma_v70_kernel(const float* __restrict__ qcur, const C* __restrict__ cache,
+                                                             const int32_t* __restrict__ firsts, const int32_t* __restrict__ counts,
+                                                             const int32_t* __restrict__ cells, int cells_stride,
+                                                             const int32_t* __restrict__ fill, const float* __restrict__ sinks, MlaArgs a,
+                                                             int ring, float* __restrict__ o_lat) {
+    extern __shared__ __align__(32) unsigned char smraw[];
+    constexpr int W = 576, M = 16 * G, NP = v70_parts<G>(), kSteps = (W / 16) / NP;
+    uint16_t* qh = (uint16_t*) smraw;
+    uint16_t* ks = qh + M * kLd;
+    uint16_t* ph = ks + kMmaCells * kLd;
+    float* sp = (float*) (ph + M * kPLd);   // [NP][M][32]
+    float* alpha_s = sp + NP * M * 32;
+    float* l_s = alpha_s + M;
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    const int t = blockIdx.y, h0 = blockIdx.x * M;
+    const int n = counts[t], first = firsts[t];
+    const int32_t* cl = cells && !(fill && fill[t] > 0) ? cells + (size_t) t * cells_stride : nullptr;
+    for (int i = tid; i < M * W; i += 256) {
+        const int h = i / W, e = i - h * W;
+        qh[h * kLd + e] = __half_as_ushort(__float2half_rn(qcur[((size_t) t * a.heads + h0) * W + i] * a.scale));
+    }
+    // the softmax: a warp keeps 2G heads
+    float m[2 * G], l[2 * G];
+#pragma unroll
+    for (int hh = 0; hh < 2 * G; ++hh) {
+        m[hh] = sinks[h0 + w * 2 * G + hh];
+        l[hh] = 1.f;
+    }
+    if (tid < M) l_s[tid] = 1.f;
+    // S: a warp takes the 16 heads of group rg, the 16 cells of half cs and part kq of the 576 dimensions;
+    // O: the 16 heads of group rg and 64 G latent dimensions from 64 G dq, in 4 G fragments
+    const int rg = w % G, cs = (w / G) & 1, kq = w / (2 * G), dq = w / G;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fo[4 * G];
+#pragma unroll
+    for (int j = 0; j < 4 * G; ++j) wmma::fill_fragment(fo[j], 0.0f);
+    constexpr int kPer = kMmaCells * (W / 8) / 256;
+    uint4 pre[kPer];
+    auto fetch = [&](int j0) {
+        const int tn = min(kMmaCells, n - j0);
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            const int i = tid + k * 256, c = i / (W / 8), ch = i - c * (W / 8);
+            pre[k] = make_uint4(0, 0, 0, 0);
+            if (c < tn) {
+                const int j = j0 + c;
+                const int cell = cl ? cl[j] : ring ? (first + j) % ring : first + j;
+                pre[k] = fetch8(cache, (size_t) cell, ch);
+            }
+        }
+    };
+    fetch(0);
+    for (int j0 = 0; j0 < n; j0 += kMmaCells) {
+        const int tn = min(kMmaCells, n - j0);
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < kPer; ++k) {
+            const int i = tid + k * 256, c = i / (W / 8), ch = i - c * (W / 8);
+            *reinterpret_cast<uint4*>(ks + c * kLd + ch * 8) = half8(cache, pre[k], ch);
+        }
+        __syncthreads();
+        if (j0 + kMmaCells < n) fetch(j0 + kMmaCells);
+        {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> fs;
+            wmma::fill_fragment(fs, 0.0f);
+#pragma unroll
+            for (int s = 0; s < kSteps; ++s) {
+                const int k0 = (kq * kSteps + s) * 16;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::load_matrix_sync(fa, reinterpret_cast<const __half*>(qh + (rg * 16) * kLd + k0), kLd);
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fb, reinterpret_cast<const __half*>(ks + (cs * 16) * kLd + k0), kLd);
+                wmma::mma_sync(fs, fa, fb, fs);
+            }
+            wmma::store_matrix_sync(sp + ((size_t) kq * M + rg * 16) * 32 + cs * 16, fs, 32, wmma::mem_row_major);
+        }
+        __syncthreads();
+        // the running softmax: a lane a cell, the NP partial scores summed in their order
+#pragma unroll
+        for (int hh = 0; hh < 2 * G; ++hh) {
+            const int h = w * 2 * G + hh;
+            const bool valid = lane < tn;
+            float s = sp[h * 32 + lane];
+#pragma unroll
+            for (int q = 1; q < NP; ++q) s += sp[(q * M + h) * 32 + lane];
+            const float sc = valid ? s : -INFINITY;
+            float mx = sc;
+            for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float nm = fmaxf(m[hh], mx);
+            const float alpha = expf(m[hh] - nm);
+            const float p = valid ? expf(sc - nm) : 0.f;
+            float sum = p;
+            for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            l[hh] = l[hh] * alpha + sum;
+            m[hh] = nm;
+            ph[h * kPLd + lane] = __half_as_ushort(__float2half_rn(p));
+            if (lane == 0) {
+                alpha_s[h] = alpha;
+                l_s[h] = l[hh];
+            }
+        }
+        __syncthreads();
+        // O = O * alpha + P V
+#pragma unroll
+        for (int j = 0; j < 4 * G; ++j)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) fo[j].x[e] *= alpha_s[rg * 16 + acc_row70(lane, e)];
+#pragma unroll
+        for (int s2 = 0; s2 < 2; ++s2) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fp;
+            wmma::load_matrix_sync(fp, reinterpret_cast<const __half*>(ph + (rg * 16) * kPLd + s2 * 16), kPLd);
+#pragma unroll
+            for (int j = 0; j < 4 * G; ++j) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fv;
+                wmma::load_matrix_sync(fv, reinterpret_cast<const __half*>(ks + (s2 * 16) * kLd + dq * 64 * G + j * 16), kLd);
+                wmma::mma_sync(fo[j], fp, fv, fo[j]);
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 4 * G; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; e += 2) {
+            const int row = rg * 16 + acc_row70(lane, e), d = dq * 64 * G + j * 16 + acc_col70(lane, e);
+            const float inv = 1.f / l_s[row];
+            *reinterpret_cast<float2*>(o_lat + ((size_t) t * a.heads + h0 + row) * a.rank + d) = make_float2(fo[j].x[e] * inv, fo[j].x[e + 1] * inv);
+        }
+}
+
+// (Lapilli) the V100's kernel on a card of compute capability 7 (BASALT_HY4_ATTN_V70=0: the emulated one, to compare);
+// mla_attend_v70_mode: 0 as the environment says, 1 off, 2 on (tests)
+std::atomic<int> v70_mode{0};
+// (Lapilli, V100) the heads a block of attend_kernel takes: 0 the rule (8 while the launch fits one block per SM, else 16), 8
+// or 16 forced: BASALT_HY4_ATT_HB, mla_attend_heads_per_block (tests). The same bits either way.
+std::atomic<int> att_hb_mode{0};
+int att_hb() {
+    static const int env = [] {
+        const char* e = std::getenv("BASALT_HY4_ATT_HB");
+        if (!e) return 0;
+        if (e[0] == '8' && e[1] == 0) return 8;
+        return e[0] == '1' && e[1] == '6' && e[2] == 0 ? 16 : 0;
+    }();
+    const int m = att_hb_mode.load(std::memory_order_relaxed);
+    return m ? m : env;
+}
+
+bool attend_v70() {
+    static const bool env_on = [] { const char* e = std::getenv("BASALT_HY4_ATTN_V70"); return !(e && e[0] == '0' && e[1] == 0); }();
+    const int mode = v70_mode.load(std::memory_order_relaxed);
+    if (mode == 1) return false;
+    int dev = 0, major = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return major == 7 && (mode == 2 || env_on);
+}
+
 __global__ void head_major_ids_kernel(int32_t* ids, int32_t* bounds, int heads, int rows) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < heads * rows) ids[i] = (i % rows) * heads + i / rows;
@@ -664,6 +843,18 @@ int mma_groups(int heads) {
     return heads % 32 == 0 ? 2 : 1;
 }
 
+int sm_major() {   // (Lapilli) the current device's compute capability, read once
+    static int major = -1;
+    if (major < 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            major = 0;
+        }
+    }
+    return major;
+}
 int chunks_of(int max_cells) { return std::max(1, (max_cells + mqa::kChunk - 1) / mqa::kChunk); }
 size_t counters_bytes(int heads) { return ((size_t) kAttTok * (heads / 8) * 4 + 255) & ~(size_t) 255; }
 
@@ -685,6 +876,24 @@ void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok
     if constexpr (!std::is_same_v<C, float>) {
         if (n_tok > kAttTok && a.heads % 16 == 0) {   // a chunk of rows; a window keeps the kernel below
             const int g = mma_groups(a.heads);
+            if (attend_v70()) {   // (Lapilli) a V100: the tensor cores' kernel
+                static bool raised70[2][8] = {};
+                int dev = 0;
+                cudaGetDevice(&dev);
+                if (bool& z = raised70[g - 1][dev & 7]; !z) {   // the opt-in is per device: two cards read prompts
+                    if (g == 2) cudaFuncSetAttribute(attend_mma_v70_kernel<C, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem_v70<2>());
+                    else cudaFuncSetAttribute(attend_mma_v70_kernel<C, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem_v70<1>());
+                    z = true;
+                }
+                if (g == 2)
+                    attend_mma_v70_kernel<C, 2><<<dim3(a.heads / 32, n_tok), 256, mma_smem_v70<2>(), st>>>(
+                        qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride, r.fill, sinks, a, ring, o_lat);
+                else
+                    attend_mma_v70_kernel<C, 1><<<dim3(a.heads / 16, n_tok), 256, mma_smem_v70<1>(), st>>>(
+                        qcur, cache, r.firsts, r.counts, r.cells, r.cells_stride, r.fill, sinks, a, ring, o_lat);
+                if (!stream) cudaStreamSynchronize(nullptr);
+                return;
+            }
             static bool raised[2] = {false, false};
             if (!raised[g - 1]) {
                 if (g == 2) cudaFuncSetAttribute(attend_mma_kernel<C, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mma_smem<2>());
@@ -717,8 +926,10 @@ void attend_impl(const float* qcur, const C* cache, const RowSpans& r, int n_tok
         const float* q = qcur + (size_t) t0 * a.heads * (mqa::kLatent + 64);
         float* o = o_lat + (size_t) t0 * a.heads * mqa::kLatent;
         // 8 heads a block while the launch fits one block per SM, else 16; the heads of a block share no sums, so both give
-        // the same bits
-        if (max_ch * (a.heads / 8) * T <= sm_count() || a.heads % 16)
+        // the same bits. (Lapilli) att_hb(): 8 or 16 forced (BASALT_HY4_ATT_HB, tests), 0 the rule; on a V100 always 8 (L2 emptied,
+        // as in a window: 64 heads at 512 cells 2 rows 36.1 -> 32.6 us, 3 rows 56.5 -> 44.4; 2,048 cells -9 to -21 %)
+        const int hb = att_hb();
+        if (hb == 8 || (hb == 0 && (sm_major() == 7 || max_ch * (a.heads / 8) * T <= sm_count())) || a.heads % 16)
             attend_kernel<R, 8><<<dim3(max_ch, a.heads / 8, T), mqa::kThreads, 0, st>>>(q, (const uint8_t*) cache, rt, ring, sinks, a.heads, a.scale,
                                                                                         max_ch, ml, op, counters, o);
         else
@@ -740,6 +951,9 @@ void query_impl(const void* w_kb, const float* q, const float* kv_raw, const flo
 }
 
 }  // namespace
+
+void mla_attend_v70_mode(int mode) { v70_mode.store(mode, std::memory_order_relaxed); }
+void mla_attend_heads_per_block(int hb) { att_hb_mode.store(hb == 8 || hb == 16 ? hb : 0, std::memory_order_relaxed); }
 
 void head_major_ids(int32_t* ids, int32_t* bounds, int heads, int rows, void* stream) {
     const int n = std::max(heads * rows, heads + 1);

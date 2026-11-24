@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>   // (Lapilli) std::getenv
 #include <iterator>
 #include <numeric>
 
@@ -95,6 +96,15 @@ core::ExpertTierSpec Hy4Model::tier_spec() const {
     s.diag_tier_ram = flags_.diag_tier_ram;
     s.diag_tier_vram = flags_.diag_tier_vram;
     s.diag_tier_frozen = flags_.diag_tier_frozen;
+    // (Lapilli) the second card's prompt rows come back summed per token: a 16K chunk's pair rows were ~600 MB a layer over
+    // a V100's x4 link, the sums ~100 MB, as FP16 rows (a power of two a row) half that (2x V100: 100 chunks KLD 0.2061
+    // against 0.2087 in FP32, the same top-1); BASALT_HY4_PEER_COMBINE=0 keeps the rows, BASALT_HY4_PEER_SUMS16=0 FP32 sums
+    {
+        const char* c = std::getenv("BASALT_HY4_PEER_COMBINE");
+        const char* h = std::getenv("BASALT_HY4_PEER_SUMS16");
+        s.share_combine = !(c && c[0] == '0' && c[1] == 0);
+        s.share_sums16 = !(h && h[0] == '0' && h[1] == 0);
+    }
     s.route_tail_skip = flags_.route.tail_skip;
     s.route_prior = flags_.route.prior;
     s.vram_reserve_mib = flags_.vram_reserve_mib;

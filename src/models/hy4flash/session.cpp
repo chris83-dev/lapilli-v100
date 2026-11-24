@@ -46,6 +46,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>   // (Lapilli) std::getenv
 #include <numeric>
 #include <cstring>
 #include <memory>
@@ -101,7 +102,7 @@ struct Bufs {
           *qabs = nullptr, *qcur = nullptr, *olat = nullptr, *vout = nullptr, *gate = nullptr, *ik = nullptr, *ikn = nullptr,
           *ivt = nullptr, *igt = nullptr, *iq = nullptr, *iw = nullptr, *gu = nullptr, *h = nullptr, *rlog = nullptr, *rw = nullptr,
           *xlat = nullptr, *lat_out = nullptr, *moe_out = nullptr, *sh = nullptr, *erows = nullptr, *ekv = nullptr, *evalid = nullptr,
-          *pair_rows = nullptr, *h_erows = nullptr, *h_e = nullptr, *h_evalid = nullptr;
+          *pair_rows = nullptr, *peer_sum = nullptr, *h_erows = nullptr, *h_e = nullptr, *h_evalid = nullptr;
     int32_t *icells = nullptr, *meta_d = nullptr, *meta_h = nullptr, *ids = nullptr, *pair_map = nullptr, *pair_ident = nullptr,
             *mmq_ident = nullptr;
     void* mmq_xq = nullptr;
@@ -394,6 +395,7 @@ public:
         b.xlat = f((int64_t) R * g_.n_latent); b.lat_out = f((int64_t) R * g_.n_latent); b.moe_out = f((int64_t) R * E); b.sh = f((int64_t) R * E);
         b.erows = f((int64_t) A * g_.n_embd); b.ekv = f((int64_t) A * 5 * E); b.evalid = f(A);
         b.pair_rows = f((int64_t) R * g_.n_used * g_.n_latent);
+        b.peer_sum = f((int64_t) R * g_.n_latent);   // (Lapilli) the second card's summed rows, one a token
         b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
         b.mmq_ident = (int32_t*) f(A);
         b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
@@ -435,6 +437,7 @@ public:
         icells_ = b.icells; meta_d_ = b.meta_d; meta_h_ = b.meta_h; gu_ = b.gu; h_ = b.h; rlog_ = b.rlog; rw_ = b.rw; ids_ = b.ids;
         xlat_ = b.xlat; lat_out_ = b.lat_out; moe_out_ = b.moe_out; sh_ = b.sh; erows_ = b.erows; ekv_ = b.ekv; evalid_ = b.evalid;
         pair_rows_ = b.pair_rows; pair_map_ = b.pair_map; pair_ident_ = b.pair_ident; mmq_ident_ = b.mmq_ident; mmq_xq_ = b.mmq_xq;
+        peer_sum_ = b.peer_sum;
         h_erows_ = b.h_erows; h_e_ = b.h_e; h_evalid_ = b.h_evalid;
     }
 
@@ -542,6 +545,12 @@ public:
     // prompt starts (a turn that starts cold shows a low first share).
     static constexpr int kEarlyTokens = 32;
     int64_t turn_tokens_ = 0, turn_h0_ = 0, turn_l0_ = 0, early_h_ = 0, early_l_ = 0, late_h_ = 0, late_l_ = 0;
+    // (Lapilli) where a decode window's time goes, seen from the host thread (decode windows only; reported with the turn's
+    // hits): the window's wall time, the host's waits for the router's ids (the card computes then), for the joiner, the CPU's
+    // experts and the second card's rows (the card's weighted sum waits for them then)
+    bool dt_on_ = false;
+    int64_t dt_windows_ = 0, dt_rows_ = 0;
+    double dt_win_ms_ = 0, dt_ids_ms_ = 0, dt_join_ms_ = 0, dt_cpu_ms_ = 0, dt_peer_ms_ = 0;
     void turn_count(int n) {
         if (!tier_) return;
         const int64_t h = tier_->hits(), lk = tier_->lookups();
@@ -556,6 +565,13 @@ public:
             basalt::log::info("basalt hy4flash", "turn decode hits: first %d tokens %.1f%% (%lld lookups), later %.1f%% (%lld lookups)", kEarlyTokens,
                               early_l_ ? 100.0 * early_h_ / early_l_ : 0.0, (long long) early_l_, late_l_ ? 100.0 * late_h_ / late_l_ : 0.0,
                               (long long) late_l_);
+        if (dt_windows_ > 0)
+            basalt::log::info("basalt hy4flash", "turn decode timing: %lld windows, %lld rows, %.2f ms a window; the host waited a window "
+                              "%.2f ms for the router's ids, %.2f ms joining the layers' shares (%.2f ms for the CPU's experts, %.2f ms "
+                              "for the second card's rows)", (long long) dt_windows_, (long long) dt_rows_, dt_win_ms_ / dt_windows_,
+                              dt_ids_ms_ / dt_windows_, dt_join_ms_ / dt_windows_, dt_cpu_ms_ / dt_windows_, dt_peer_ms_ / dt_windows_);
+        dt_windows_ = dt_rows_ = 0;
+        dt_win_ms_ = dt_ids_ms_ = dt_join_ms_ = dt_cpu_ms_ = dt_peer_ms_ = 0;
         turn_tokens_ = early_h_ = early_l_ = late_h_ = late_l_ = 0;
         if (tier_) { turn_h0_ = tier_->hits(); turn_l0_ = tier_->lookups(); }
     }
@@ -575,6 +591,12 @@ public:
         if (r.n_tokens < 1) return {model::Status::Error, "hy4flash: an empty window"};
         std::string err;
         release_prompt();
+        struct Dt {   // (Lapilli) the window's wall time
+            Session& s;
+            const double t0;
+            explicit Dt(Session& x, int n) : s(x), t0(now_ms()) { s.dt_on_ = true; ++s.dt_windows_; s.dt_rows_ += n; }
+            ~Dt() { s.dt_win_ms_ += now_ms() - t0; s.dt_on_ = false; }
+        } dt{*this, r.n_tokens};
         // the lossy routing flags apply to decode windows only: prompts route as the model does
         struct Lossy {
             core::ExpertTier*& t;
@@ -2253,10 +2275,20 @@ private:
             for (size_t i = 0; i < cpu.pair.size(); ++i) map_h[(size_t) cpu.pair[i]] = (int32_t) (at + (int64_t) i);
             n_cpu_rows_ += (int64_t) cpu.pair.size();
         }
+        bool peer_summed = false;   // (Lapilli) the second card's rows came back summed per token, in peer_sum_
         if (!peer.empty()) {   // its rows after the main card's
+            // (Lapilli) a share opened with Dims::combine sends one row per token, the sum of its rows times their weights:
+            // the router's weights come to the host too, and the weighted sum leaves those pairs out (map -1)
+            const bool comb = share->combines();
+            std::vector<float> hw;
+            if (comb) {
+                hw.resize((size_t) R * K);
+                cudaMemcpy(hw.data(), rw_, hw.size() * 4, cudaMemcpyDeviceToHost);   // the stream drained above: rw_ is the chunk's
+            }
             int64_t at = 0;
             for (int e : used) at += (int64_t) by[(size_t) e].size();
             std::vector<std::vector<int32_t>> tok(peer.size());
+            std::vector<std::vector<float>> wts(comb ? peer.size() : 0);
             std::vector<prefill::PeerShare::Expert> ex;
             int64_t end = at;
             for (size_t i = 0; i < peer.size(); ++i) {
@@ -2264,17 +2296,26 @@ private:
                 const core::ExpertTier::Source src = tier_->locate(tl, e);
                 for (int32_t p : by[(size_t) e]) {
                     tok[i].push_back(p / K);
-                    map_h[(size_t) p] = (int32_t) end++;
+                    if (comb) {
+                        wts[i].push_back(hw[(size_t) p]);
+                        map_h[(size_t) p] = -1;
+                        ++end;
+                    } else {
+                        map_h[(size_t) p] = (int32_t) end++;
+                    }
                 }
                 prefill::PeerShare::Expert x1;
                 x1.blob = src.peer ? src.peer : src.pinned;
                 x1.on_peer = src.peer != nullptr;
                 x1.tok = tok[i].data();
+                x1.w = comb ? wts[i].data() : nullptr;
                 x1.n = (int) tok[i].size();
                 ex.push_back(x1);
             }
-            if (!share->run(share_layer(tl), xlat_, R, ex, pair_rows_ + (size_t) at * L, st, err)) return false;
+            if (comb && end == at) cudaMemsetAsync(peer_sum_, 0, (size_t) R * L * 4, st);   // no row: the share writes no sums
+            if (!share->run(share_layer(tl), xlat_, R, ex, comb ? peer_sum_ : pair_rows_ + (size_t) at * L, st, err)) return false;
             n_peer_rows_ += end - at;
+            peer_summed = comb;
         }
         if (ringed && tl + 1 < g_.n_layers - g_.n_dense && ring_layer_[(tl + 1) & 1] == tl + 1) stage_away(tl + 1);
         auto launch = [&](Stage& B, const uint8_t* blobs, int nb, int64_t rows, int64_t max_rows, const std::vector<int32_t>& tok,
@@ -2409,7 +2450,7 @@ private:
             put_f32(pair_rows_ + (size_t) cpu.at * L, cpu_rows_, (int64_t) cpu.pair.size() * L);
         }
         put_i32(pair_map_, map_h.data(), (size_t) R * K);
-        weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st);
+        weighted_sum_tokens(pair_rows_, pair_map_, rw_, R, K, L, lat_out_, st, peer_summed ? peer_sum_ : nullptr);
         const double tg = now_ms();
         cudaStreamSynchronize(st);   // the host's map is read until the copy lands
         t_gpu_wait_ms_ += now_ms() - tg;
@@ -2429,6 +2470,7 @@ private:
 
     // The published ids have landed (the stream goes on meanwhile); a launch that failed never writes them.
     bool await_ids(std::string& err) {
+        struct Dt { Session& s; const double t0; ~Dt() { if (s.dt_on_) s.dt_ids_ms_ += now_ms() - t0; } } dt{*this, now_ms()};
         const volatile uint32_t* seq = h_words_;
         for (int s = 0; s < (1 << 22); ++s) {
             if (*seq == seq_want_) {
@@ -2449,6 +2491,22 @@ private:
     // into L2 meanwhile, up to kReadAheadBytes, so those products read L2 instead of memory. The requests start behind the
     // card's experts and stop once the wait is over; they change no result.
     static constexpr uint64_t kReadAheadBytes = 56ull << 20;
+    // (Lapilli) on a card with a small L2 (a V100: 6 MB) the read-ahead has nothing to keep (the bulk prefetch is a no-op there,
+    // each block only reads a step's last 16 bytes) and its blocks share the SMs with the experts: off below 32 MB of L2, as
+    // Inkling's (c0354676); BASALT_HY4_READ_AHEAD=0|1 decides
+    static bool read_ahead_on() {
+        static const bool on = [] {
+            const char* e = std::getenv("BASALT_HY4_READ_AHEAD");
+            if (e != nullptr && (e[0] == '0' || e[0] == '1') && e[1] == 0) return e[0] == '1';
+            int dev = 0, l2 = 0;
+            if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev) != cudaSuccess) {
+                cudaGetLastError();
+                return true;
+            }
+            return l2 >= (32 << 20);
+        }();
+        return on;
+    }
     void read_ahead(int l, uint32_t word, cudaStream_t st) {
         if (ra_.empty()) {   // every layer's ranges, once
             ra_.resize((size_t) g_.n_layers);
@@ -2579,7 +2637,7 @@ private:
                                                                       : d_rows_ + (size_t) r * L);
         put_words(&put, ex_plan_, (int) ((offsetof(WindowPut, rows) + (size_t) G * K * 8) / 4), st);
         if (nhits) launch(ex_plan_, nhits, ne);
-        if (pd.word) read_ahead(l, pd.word, st);
+        if (pd.word && read_ahead_on()) read_ahead(l, pd.word, st);
         if (n_fetched) {
             WindowPlan p2;
             const int ng = make_plan(p2, true, ne);
@@ -2627,6 +2685,7 @@ private:
     // never waits for good.
     bool join_moe(std::string& err) {
         if (!pend_.on) return true;
+        struct Dt { Session& s; const double t0; ~Dt() { if (s.dt_on_) s.dt_join_ms_ += now_ms() - t0; } } dt{*this, now_ms()};
         if (use_joiner_ && pend_.word && !pend_.reading && joiner_.joinable()) {   // handed to the joiner: its result
             while (!jdone_.load(std::memory_order_acquire)) platform::cpu_relax();
             pend_.on = false;
@@ -2640,7 +2699,9 @@ private:
     bool join_body(std::string& err) {
         Pending& pd = pend_;
         bool ok = true;
+        const double tc = now_ms();
         if (pd.cpu) tier_->finish_cpu();
+        if (dt_on_) dt_cpu_ms_ += now_ms() - tc;
         if (pd.reading) {
             if (tier_->await_reads(err)) {
                 tier_->start_cpu_window(pd.tl, h_x_, pd.lk, pd.use, h_rows_, /*reading=*/true);
@@ -2651,7 +2712,9 @@ private:
             tier_->promote(pd.tl, pd.lk);
         }
         std::string pe;
+        const double tp = now_ms();
         if (pd.peer && pd.peer_raised && !pd.peer->finish(nullptr, pe)) ok = false;
+        if (dt_on_) dt_peer_ms_ += now_ms() - tp;
         if (pd.peer && !pd.peer_raised) pd.peer->raise(0, nullptr, nullptr, pe);
         if (!pe.empty() && err.empty()) err = pe;
         if (pd.word) {
@@ -2973,6 +3036,7 @@ private:
     size_t stride_ = 0;
     uint64_t launch_ = 0;
     float* pair_rows_ = nullptr;
+    float* peer_sum_ = nullptr;   // (Lapilli) a prompt chunk's rows from the second card, summed per token there
     int32_t *pair_map_ = nullptr, *pair_ident_ = nullptr;
     void *xq1_ = nullptr, *xq2_ = nullptr;
     basalt::prefill::mmq::Context mmq_;

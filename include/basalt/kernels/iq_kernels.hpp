@@ -105,6 +105,10 @@ void native_grouped_set_v1(bool v1);
 /// gate/up 1 to 4 (1: its original bounds), down 0 to 4 (0: its original bounds); gu 0 = both as BASALT_EXPERTS_MINB says
 /// (unset: by format, as measured on a V100).
 void native_grouped_set_minb(int gu, int down);
+/// (Lapilli, tests) gate/up at n_embd 1536 and down at n_ff 1536 on the unrolled row (the same bits): 0 as BASALT_EXPERTS_U1536
+/// says (on unless =0),
+/// 1 the generic row, 2 the unrolled one
+void native_grouped_set_unroll1536(int mode);
 /// What those switches say now, for kernels built on this file's device code elsewhere.
 int native_grouped_gu2();
 bool native_grouped_v1();

@@ -385,6 +385,9 @@ def make_handler(target: Service | Router):
             elif path == "/api/logs":
                 if self._authorized():
                     self._logs()
+            elif path == "/api/engine-settings":           # (Lapilli) the page's Engine settings
+                if self._authorized():
+                    self._json(200, router.shown().engine_settings())
             elif path in ("", "/dashboard"):
                 # "/" serves the Lapilli chat page; Basalt's dashboard stays at /dashboard
                 body = (ROOT / "serve" / "web" / ("index.html" if path == "/dashboard" else "lapilli.html")).read_bytes()
@@ -534,6 +537,12 @@ def make_handler(target: Service | Router):
                         totals_with_cost(totals, shown.cost_input_per_million, shown.cost_output_per_million,
                                          shown.cost_cache_write_per_million, shown.cost_cache_hit_per_million)
                     self._json(200, {"status": "ok", "changed": changed, "totals": totals})
+                    return
+                if path == "/api/engine-settings":       # (Lapilli) a new context and/or image input, by a restart
+                    if not self._own_page("engine settings can be changed"):
+                        return
+                    self._json(202, router.shown().request_engine_settings(context=req.get("context"),
+                                                                            vision=req.get("vision")))
                     return
                 if path == "/api/totals-reset":
                     if not self._own_page("totals can be reset"):

@@ -120,6 +120,7 @@ function montrerVue(nom) {
   if (vue === "discussion" && !estTactile()) $("saisie").focus();
   if (mesures) dessinerMesures(mesures);
   if (vue === "experts" && mesures && !mesures.experts_map) relever();   // its map now, not at the next reading
+  if (vue === "apropos") lireReglagesMoteur();
 }
 for (const b of document.querySelectorAll(".onglet")) b.onclick = () => montrerVue(b.dataset.vue);
 window.addEventListener("hashchange", () => montrerVue(location.hash.slice(1)));
@@ -188,6 +189,196 @@ $("cle-api").onchange = () => {
   memoire.ecrire("cle", $("cle-api").value.trim());
   annonce("succes", "API key saved", "It stays in this browser.", 3000);
   relever();
+  lireReglagesMoteur();
+};
+
+// ------------------------------------------------------------------ Engine settings
+// The context length and the image input this server keeps for its model (GET/POST api/engine-settings): people run
+// Lapilli with nothing around it, so this page is where they are set. Applying restarts the engine once the response being
+// written has finished; settings that cannot start give way to the previous ones. The card's state line follows a change
+// this page made or saw happen (waiting, restarting with the load's percent, then its result, closable), never an old one.
+let reglagesMoteur = null, choixMoteur = null, minuterieMoteur = null, dernierEtatMoteur = "";
+let suiviMoteur = false, resultatMoteur = "", resultatFerme = "", lectureMoteur = "", refusMoteur = "", hvConnu = 0;
+const sansPoint = (t) => String(t || "").trim().replace(/[.\s]+$/, "");
+async function lireReglagesMoteur() {
+  clearTimeout(minuterieMoteur);
+  minuterieMoteur = null;
+  let r;
+  try {
+    r = await fetch("api/engine-settings", {cache: "no-store", headers: entetes()});
+  } catch (e) {
+    lectureMoteur = "the server cannot be reached";
+    dessinerReglagesMoteur();
+    minuterieMoteur = setTimeout(lireReglagesMoteur, 3000);
+    return;
+  }
+  if (r.status === 404 || r.status === 401) {     // a server without them, or a key to enter first (read again once saved)
+    reglagesMoteur = null;
+    lectureMoteur = "";
+    dessinerReglagesMoteur();
+    return;
+  }
+  if (!r.ok) {
+    lectureMoteur = sansPoint((await refus(r)).message);
+    dessinerReglagesMoteur();
+    minuterieMoteur = setTimeout(lireReglagesMoteur, 3000);
+    return;
+  }
+  try {
+    reglagesMoteur = await r.json();
+  } catch (e) {
+    lectureMoteur = "the server's answer could not be read";
+    dessinerReglagesMoteur();
+    minuterieMoteur = setTimeout(lireReglagesMoteur, 3000);
+    return;
+  }
+  lectureMoteur = "";
+  const st = reglagesMoteur.state || {};
+  const enCoursM = st.status === "pending" || st.status === "applying";
+  const marque = `${st.status}:${st.at || 0}`;
+  if (marque !== dernierEtatMoteur) {
+    if (suiviMoteur && !enCoursM) {                // the change this page followed has just ended
+      suiviMoteur = false;
+      resultatMoteur = marque;
+      choixMoteur = null;
+      lireSante();                                 // the new context and image input: the length steps, the attach button
+      relever();                                   // the pastille says it at the same time, not a second later
+      if (vue !== "apropos") {                     // the card says it; on another tab a toast does
+        if (st.status === "ok") annonce("succes", "Engine restarted", `${resumeMoteur(st)}.`, 5000);
+        else if (st.status === "failed") annonce("erreur", "Engine settings not applied", st.restored === false
+          ? "The previous settings did not start either: see About." : "The engine is back on its previous settings.", 8000);
+      }
+    }
+    dernierEtatMoteur = marque;
+  }
+  if (enCoursM) suiviMoteur = true;
+  dessinerReglagesMoteur();
+  // every half second while a change is on (a small answer): "Waiting…" gives way to the restart as the pastille goes Idle
+  if (enCoursM) minuterieMoteur = setTimeout(lireReglagesMoteur, 500);
+}
+function resumeMoteur(o) {
+  const morceaux = [];
+  if (o.context) morceaux.push(`context ${nf(o.context)}\u00a0tokens`);
+  if (o.vision) morceaux.push(`image input ${o.vision}`);
+  const t = morceaux.join(", ");
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+function dessinerReglagesMoteur() {
+  const m = reglagesMoteur, carte = $("carte-reglages-moteur");
+  carte.hidden = !(m && m.supported);
+  ligneContexte();                                 // the drawer's link to this card follows it
+  if (carte.hidden) return;
+  const c = m.context || {}, v = m.vision || {}, st = m.state || {};
+  const occupeM = st.status === "pending" || st.status === "applying";
+  const voulu = {context: (choixMoteur && choixMoteur.context) || c.value, vision: (choixMoteur && choixMoteur.vision) || v.value};
+  // the lengths: the model's own steps, the default one named; a length kept from before stays in its place
+  const choix = [...(c.choices || [])];
+  if (c.value && !choix.includes(c.value)) choix.push(c.value);
+  choix.sort((a, b) => a - b);
+  const sel = $("m-contexte");
+  const cle = choix.join(",") + ":" + c.default;
+  if (sel.dataset.cle !== cle) {
+    sel.replaceChildren(...choix.map((n) => {
+      const o = document.createElement("option");
+      o.value = String(n);
+      o.textContent = `${nf(n)} tokens${n === c.default ? " (default)" : ""}`;
+      return o;
+    }));
+    sel.dataset.cle = cle;
+  }
+  sel.value = String(voulu.context || "");
+  const parLigne = c.source === "command line" || c.source === "slots";
+  sel.disabled = parLigne || occupeM;
+  $("o-m-contexte").textContent = c.serving && c.serving !== c.value ? `serving ${nf(c.serving)}` : "";
+  if (c.source === "command line") phraseDrapeaux($("m-contexte-note"), "Set on the server's command line (", "--max-context", "): change it there.");
+  else if (c.source === "slots") phraseDrapeaux($("m-contexte-note"), "Several slots share the context (", "--parallel", "): set ", "--max-context", " on the command line.");
+  else $("m-contexte-note").textContent = `${c.model_max ? `The model reads up to ${nf(c.model_max)}\u00a0tokens. ` : ""}A longer context sets more memory aside when the engine starts.`;
+  const bv = $("m-vision");
+  bv.setAttribute("aria-checked", String(voulu.vision === "on"));
+  bv.disabled = !v.available || v.source === "command line" || occupeM;
+  // what is served now (the switch shows the choice, "Not applied yet." the difference); the encoder's size from the engine
+  if (mesures && mesures.live && mesures.live.state !== "loading") hvConnu = +(mesures.engine || {}).host_vision_bytes || 0;
+  const hv = hvConnu;                              // the last known while the engine loads (its facts are gone meanwhile)
+  const encodeur = `the encoder waits in RAM${hv ? ` (${go(hv)}\u00a0GB)` : ""} and uses a card only while it reads an image.`;
+  if (!v.available) $("m-vision-note").textContent = "This model file carries no image encoder.";
+  else if (v.source === "command line") phraseDrapeaux($("m-vision-note"), "Set on the server's command line (", "--vision", "): change it there.");
+  else $("m-vision-note").textContent = v.value === "on" ? `Images can be attached in the chat: ${encodeur}`
+    : `Images cannot be attached in the chat. Turned on, ${encodeur}`;
+  const change = (voulu.context !== c.value && !parLigne) || (voulu.vision !== v.value && v.available && v.source !== "command line");
+  $("m-appliquer").disabled = !change || occupeM;
+  // the state line: a reading problem, the change in progress, its result (closable), a refusal, or a choice not applied yet
+  const marque = `${st.status}:${st.at || 0}`;
+  let texte = "", fermable = false;
+  if (lectureMoteur) texte = `Cannot read the engine settings: ${lectureMoteur}. Trying again…`;
+  else if (st.status === "pending") texte = "Waiting for the current response to finish…";
+  else if (st.status === "applying") {
+    const l = mesures && mesures.live;
+    const pct = l && l.state === "loading" && l.load && l.load.percent != null ? l.load.percent : null;
+    texte = `Restarting the engine…${pct != null ? ` ${nf(pct)}%` : ""}`;
+  } else if (refusMoteur) {
+    texte = refusMoteur; fermable = true;
+  } else if (marque === resultatMoteur && marque !== resultatFerme) {
+    fermable = true;
+    if (st.status === "ok") texte = `Applied: ${resumeMoteur(st).toLowerCase()}${st.note ? `, but ${sansPoint(st.note)}` : ""}.`;
+    else texte = `Not applied: ${sansPoint(st.error) || "the engine did not start"}. ` + (st.restored === false
+      ? `The previous settings did not start either: ${sansPoint(st.restore_error) || "no reason given"}.`
+      : "The engine is back on its previous settings.");
+  } else if (change) texte = "Not applied yet.";
+  const genre = !fermable ? "" : refusMoteur || st.status === "failed" ? "echec" : "ok";
+  const boite = $("m-etat-boite");
+  $("m-etat").textContent = texte;
+  boite.hidden = !texte;
+  if (genre) boite.dataset.genre = genre; else delete boite.dataset.genre;
+  $("m-etat-ic").toggleAttribute("hidden", !genre);     // an <svg> has no .hidden property: the attribute itself
+  $("m-etat-ic").querySelector("use").setAttribute("href", `web/lapilli-icons.svg#i-${genre === "echec" ? "erreur" : "succes"}`);
+  $("m-etat-fermer").hidden = !fermable;
+}
+// a sentence whose command-line flags keep their two hyphens: they go in a monospace span (the text font joins "--")
+function phraseDrapeaux(el, ...morceaux) {
+  el.replaceChildren(...morceaux.map((m) => {
+    if (!m.startsWith("--")) return document.createTextNode(m);
+    const d = document.createElement("span");
+    d.className = "drapeau";
+    d.textContent = m;
+    return d;
+  }));
+}
+$("m-etat-fermer").onclick = () => {
+  if (refusMoteur) refusMoteur = "";
+  else resultatFerme = resultatMoteur;
+  dessinerReglagesMoteur();
+};
+// a new choice: the result or refusal of the change before is past, the state line says the choice is not applied yet
+// (the real window: "Applied: context 65,536 tokens." stayed beside a new image-input choice)
+function nouveauChoix(maj) {
+  choixMoteur = {...(choixMoteur || {}), ...maj};
+  refusMoteur = "";
+  resultatFerme = resultatMoteur;
+  dessinerReglagesMoteur();
+}
+$("m-contexte").onchange = () => nouveauChoix({context: +$("m-contexte").value});
+$("m-vision").onclick = () => {
+  const v = (reglagesMoteur && reglagesMoteur.vision) || {};
+  const actuel = (choixMoteur && choixMoteur.vision) || v.value;
+  nouveauChoix({vision: actuel === "on" ? "off" : "on"});
+};
+$("m-appliquer").onclick = async () => {
+  const m = reglagesMoteur || {}, c = m.context || {}, v = m.vision || {}, corps = {};
+  if (choixMoteur && choixMoteur.context && choixMoteur.context !== c.value) corps.context = choixMoteur.context;
+  if (choixMoteur && choixMoteur.vision && choixMoteur.vision !== v.value) corps.vision = choixMoteur.vision;
+  if (!Object.keys(corps).length) return;
+  $("m-appliquer").disabled = true;
+  try {
+    const r = await fetch("api/engine-settings", {method: "POST", headers: entetes(true), body: JSON.stringify(corps)});
+    if (!r.ok) throw await refus(r);
+    suiviMoteur = true;
+    refusMoteur = "";
+    resultatFerme = "";
+    relever();                                     // the pastille: waiting or loading at once
+  } catch (e) {
+    refusMoteur = e.detail ? `Not applied: ${sansPoint(e.detail)}.` : e.message;
+  }
+  lireReglagesMoteur();
 };
 
 // ------------------------------------------------------------------ metrics (/metrics), every second
@@ -206,7 +397,15 @@ async function relever() {
     } else if (!r.ok) {
       throw await refus(r);
     } else {
+      const avant = mesures;
       mesures = await r.json();
+      // the engine has just loaded again, or serves another context (Engine settings applied, from this page or
+      // another): /health again, for the length steps and the attach button
+      const chargeait = avant && avant.live && avant.live.state === "loading";
+      const charge = mesures.live && mesures.live.state === "loading";
+      if (avant && !charge && (chargeait || (mesures.engine || {}).max_context !== (avant.engine || {}).max_context)) lireSante();
+      // the card on About follows each reading: the load's percent, and the encoder's size once the engine is back
+      if (reglagesMoteur && (vue === "apropos" || (reglagesMoteur.state || {}).status === "applying")) dessinerReglagesMoteur();
       if (echecs >= 3) annonce("succes", "Server reachable again", "", 3000);
       echecs = 0;
       dessinerMesures(mesures);
@@ -279,7 +478,10 @@ function dessinerApropos(m) {
   const octetsCartes = ti ? (ti.main.bytes || 0) + (ti.peer.bytes || 0) : (eng.expert_cache_mib || 0) * 1048576;
   const tousExperts = m.experts && m.experts.layers ? m.experts.layers * m.experts.per_layer : eng.expert_total;
   const kv = {int8: "8-bit", q4_0: "4-bit", fp16: "16-bit", f16: "16-bit", bf16: "16-bit"}[eng.kv] || eng.kv;
-  faits($("faits-moteur"), [
+  // while the engine loads (a restart from Engine settings), /metrics no longer has its facts: the last known stay
+  // until it is back, so the cards below do not jump up 63 px and back down (measured at 1280 px)
+  const chargeA = m.live && m.live.state === "loading" && $("faits-moteur").childElementCount > 0;
+  if (!chargeA) faits($("faits-moteur"), [
     ["Model", `${eng.model || sante.model}${eng.quant ? ` · ${eng.quant}` : ""}`],
     ["Engine", `Lapilli, based on Basalt ${eng.version || eng.engine || ""}`.trim()],
     ["Context", eng.max_context ? `${nf(eng.max_context)} tokens` : null],
@@ -827,9 +1029,31 @@ function construirePaliers() {
   const option = (v, texte) => { const o = document.createElement("option"); o.value = String(v); o.textContent = texte; return o; };
   const valeurs = PALIERS.filter((v) => (ctx > 0 ? v < ctx : v <= 32768));
   $("r-longueur").replaceChildren(...valeurs.map((v) => option(v, `${nf(v)} tokens`)), option(0, "No limit"));
+  ligneContexte();
+}
+// the drawer's context line; with the Engine settings card on About, a link to it
+let lignePour = "";
+function ligneContexte() {
+  const ctx = +sante.max_context || 0;
+  const lien = !!(reglagesMoteur && reglagesMoteur.supported);
+  if (lignePour === `${ctx}:${lien}`) return;
+  lignePour = `${ctx}:${lien}`;
   const c = $("r-contexte");
   c.hidden = !(ctx > 0);
-  c.textContent = ctx > 0 ? `This model's context: ${nf(ctx)}\u00a0tokens, the conversation and the response together.` : "";
+  c.replaceChildren();
+  if (!(ctx > 0)) return;
+  c.append(`This model's context: ${nf(ctx)}\u00a0tokens, the conversation and the response together.`);
+  if (!lien) return;
+  const a = document.createElement("a");
+  a.href = "#apropos";
+  a.textContent = "Change it under About";
+  a.onclick = (e) => {                              // the drawer closes on the Engine settings card
+    e.preventDefault();
+    ouvrirTiroir(false);
+    montrerVue("apropos");
+    $("carte-reglages-moteur").scrollIntoView({block: "start"});
+  };
+  c.append(" ", a, ".");
 }
 function chargerTiroir() {
   for (const b of $("r-reflexion").children) b.setAttribute("aria-checked", String(b.dataset.v === reglages.reflexion));
@@ -1324,6 +1548,7 @@ function exporter() {
   lireSante();
   lireProps();
   relever();
+  lireReglagesMoteur();
   window.addEventListener("resize", () => { ajusterSaisie(); majVersBas(); });
   // marked arrives with "defer" just before this script; if it is missing, the text stays readable as is
   if (!window.marked) annonce("alerte", "Formatting unavailable", "Text is shown raw (marked could not be loaded).", 8000);

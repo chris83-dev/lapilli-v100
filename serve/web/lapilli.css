@@ -117,6 +117,7 @@ button { font-family: inherit; }
           font: 400 14px var(--police); width: 100%; }
 .entree:focus { outline: 0; border-color: var(--focus); box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 20%, transparent); }
 select.entree { cursor: pointer; }
+.entree:disabled { opacity: .55; cursor: not-allowed; }
 .curseur { width: 100%; accent-color: var(--accent); }
 .curseur:disabled { opacity: .45; }
 .bascule { position: relative; width: 42px; height: 24px; flex: none; border-radius: var(--r-pilule); border: 0; background: var(--surface-3);
@@ -125,6 +126,7 @@ select.entree { cursor: pointer; }
                   box-shadow: 0 1px 2px rgba(0, 0, 0, .25); transition: transform var(--duree) var(--courbe); }
 .bascule[aria-checked="true"] { background: var(--accent); }
 .bascule[aria-checked="true"]::after { transform: translateX(18px); }
+.bascule:disabled { opacity: .45; cursor: not-allowed; }
 .bascule-ligne { display: flex; align-items: center; justify-content: space-between; gap: 16px; font-size: 14px; color: var(--encre-2); }
 .segments { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; padding: 4px; border-radius: var(--r-m); background: var(--surface-2);
             border: 1px solid var(--ligne-douce); }
@@ -417,6 +419,24 @@ div.outil__cle { margin: 0 0 6px; }
          display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .carte__titre { font-size: 15px; font-weight: 650; letter-spacing: -.01em; color: var(--encre); }
 .carte__tete { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.carte__pied { display: flex; align-items: center; gap: 10px 12px; flex-wrap: wrap; padding-top: 14px; border-top: 1px solid var(--ligne-douce); }
+/* the state of a change, beside the button: waiting or restarting in plain words; its result in a tinted box that
+   holds its icon, its words and the small cross that closes it, close together at any width */
+.etat-moteur { display: flex; align-items: flex-start; gap: 6px; flex: 0 1 auto; min-width: 0; color: var(--encre-douce); }
+.etat-moteur > span { min-width: 0; padding: 5px 0; overflow-wrap: anywhere; }
+.etat-moteur > .ic { width: 16px; height: 16px; margin-top: 6px; }
+.etat-moteur[data-genre] { padding: 0 2px 0 10px; border-radius: 10px; }
+.etat-moteur[data-genre="ok"] { background: var(--succes-teinte); color: var(--succes-texte); }
+.etat-moteur[data-genre="echec"] { background: var(--danger-teinte); color: var(--danger-texte); }
+.etat-moteur[data-genre] .btn--mini { color: inherit; }
+.btn--mini { width: 26px; height: 26px; margin-top: 1px; border-radius: 8px; }
+.btn--mini .ic { width: 14px; height: 14px; }
+/* a command-line flag in a note: its two hyphens stay two hyphens (the text font joins them into one long dash) */
+.drapeau { font-family: var(--police-mono); font-size: .92em; white-space: nowrap; }
+.ic[hidden] { display: none; }
+/* the card's sentences end on more than one word */
+#carte-reglages-moteur p, #carte-reglages-moteur .petit { text-wrap: pretty; }
+#carte-reglages-moteur { scroll-margin-top: 16px; }   /* reached from the drawer's link: a gap under the header */
 .moniteur { max-width: 1240px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
 .etat-carte__haut { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px 20px; flex-wrap: wrap; }
 .etat-carte__titre { display: flex; flex-direction: column; gap: 4px; min-width: 0; }

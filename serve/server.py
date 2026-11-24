@@ -122,6 +122,48 @@ def model_file_problems(settings) -> list[str]:
     return out
 
 
+def page_settings_for(a, file_engine: list[str], cli_engine: list[str], cfg: dict):
+    """(Lapilli) The context and image input this model starts with (serve/engine/settings.py): the command line or
+    --config first, then what the server's page kept for this model file, then the defaults. A context it picks is
+    added to `cli_engine`; returns the --vision mode; what the page needs to show and change goes to cfg["page_settings"]."""
+    from serve.engine import modelfile
+    from serve.engine import settings as page
+    try:
+        mf = modelfile.ModelFile(a.model)
+        meta = json.loads(mf.read("meta"))
+    except Exception:                                    # an unreadable file: model_config says what is wrong with it
+        return a.vision
+    store = modelfile.cache_dir(mf) / page.FILE
+    saved = page.load(store)
+    native = page.native_context(meta)
+    has_projector = "vision/mmproj" in mf.sections
+    if page.flag_given(file_engine + cli_engine, "--max-context"):
+        context_source = "command line"
+    elif (getattr(a, "parallel", 0) or 0) > 1:           # several slots share the engine's default context (split_default)
+        context_source = "slots"
+    else:
+        want = saved.get("max_context")
+        if want:
+            try:
+                n = page.check_context(want, native)
+                context_source = "page"
+            except ValueError:
+                n, context_source = page.default_context(native), "default"
+        else:
+            n, context_source = page.default_context(native), "default"
+        cli_engine += ["--max-context", str(n)]
+    mode = a.vision
+    if mode is None:
+        want = saved.get("vision")
+        mode = "dynamic" if has_projector and want != "off" else "off"
+        vision_source = "page" if want else "default"
+    else:
+        vision_source = "command line"
+    cfg["page_settings"] = {"path": str(store), "native_context": native, "context_source": context_source,
+                            "vision_source": vision_source, "vision_available": has_projector}
+    return mode
+
+
 def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: list[str], known) -> dict:
     """What one configured model's file and flags imply, by the engine's own rules and without loading anything; fail()
     for what stops the start."""
@@ -146,8 +188,10 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
         except ValueError as e:
             fail(str(e))
         mode = a.vision
+        if not a.mock_engine:
+            mode = page_settings_for(a, file_engine, cli_engine, cfg)
         spec = modelfile.ModelSpec(a.model, alias=a.alias, gpu=a.gpu,
-                                   vision=False if a.mock_engine or mode == "off" else mode,
+                                   vision=False if a.mock_engine or mode in (None, "off") else mode,
                                    engine_words=tuple(file_engine + cli_engine))
         try:
             cfg.update(modelfile.model_config(spec, a.engine_bin))
@@ -299,6 +343,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect, video_max_tokens=a.video_max_tokens)
     svc.logs = logs
+    svc.page_settings = cfg.get("page_settings")      # (Lapilli) what the page's Engine settings show and change
     svc.idle_unload_s = a.idle_unload or 0
     svc.idle_sleep_s = a.idle_sleep or 0
     svc.min_free_vram_mib = a.min_free_vram_mib or 0

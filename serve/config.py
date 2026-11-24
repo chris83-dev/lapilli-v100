@@ -569,10 +569,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "named without the dashes. \"server\" holds what the server shares, \"engine\" what applies to "
                          "every model that takes it, a model entry that model's own; a list gives a flag several "
                          "values; the command line wins over it, for every model")
-    ap.add_argument("--vision", nargs="?", const="", default="off", type=vision_setting, metavar="MODE|GPU",
-                    help="image input: off (default), dynamic (inside the engine: it borrows expert-cache slots "
+    ap.add_argument("--vision", nargs="?", const="", default=None, type=vision_setting, metavar="MODE|GPU",
+                    help="image input: off, dynamic (inside the engine: it borrows expert-cache slots "
                          "on the main GPU while it reads an image, no standing VRAM), cpu (no VRAM, slow) or a "
-                         "GPU number, as nvidia-smi numbers them: the encoder sidecar, always on that card")
+                         "GPU number, as nvidia-smi numbers them: the encoder sidecar, always on that card. Not given: "
+                         "the choice made on the server's page (Engine settings), else dynamic when the model file "
+                         "carries a projector (Lapilli)")
     ap.add_argument("--image-url-host", action="append", default=[], metavar="HOST[:PORT]", type=image_url_host,
                     help="let requests from other machines name http(s) image URLs on exactly this host (repeatable; "
                          "without a port, 80 and 443). A name must resolve to public addresses; an IP address is "

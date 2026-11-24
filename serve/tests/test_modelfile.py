@@ -217,12 +217,47 @@ class Cli(Tmp):
         from serve import server
         path = self.build(vision=True)
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
-        for flags, want in (([], False), (["--vision", "1"], "1"),
+        # (Lapilli) not given: the page's choice, else on (dynamic) for a file with a projector
+        for flags, want in (([], "dynamic"), (["--vision", "1"], "1"),
                             (["--vision", "dynamic"], "dynamic"), (["--vision", "cpu"], "cpu"), (["--vision", "off"], False)):
             with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
                     mock.patch("sys.stderr", io.StringIO()):
                 self.run_main(*base, *flags)
             self.assertEqual(mc.call_args.args[0].vision, want, flags)
+
+    def test_vision_stays_off_for_a_file_without_a_projector(self):
+        path = self.build(vision=False)
+        base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
+        with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
+                mock.patch("sys.stderr", io.StringIO()):
+            self.run_main(*base)
+        self.assertEqual(mc.call_args.args[0].vision, False)
+
+    def test_the_page_settings_order_at_start(self):
+        """(Lapilli) The command line wins, then what the page kept for this file, then the defaults (32K, images on)."""
+        from serve.engine import settings as page
+        path = self.build(vision=True, meta={**META, "gguf_kv": {**META["gguf_kv"], "tiny.context_length": 65536}})
+        base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
+
+        def spec_of(*flags):                             # the engine binary here is empty: its flags are given
+            with mock.patch.object(modelfile, "model_config", side_effect=ValueError("stop")) as mc, \
+                    mock.patch("serve.server.engine_flags_of", return_value={"--max-context", "--gpu", "--vision"}), \
+                    mock.patch("sys.stderr", io.StringIO()):
+                self.run_main(*base, *flags)
+            return mc.call_args.args[0]
+        s = spec_of()
+        self.assertEqual(page.context_of(list(s.engine_words)), 32768)
+        self.assertEqual(s.vision, "dynamic")
+        store = modelfile.cache_dir(ModelFile(path)) / page.FILE
+        page.save(store, {"max_context": 16384, "vision": "off"})
+        s = spec_of()
+        self.assertEqual(page.context_of(list(s.engine_words)), 16384)
+        self.assertEqual(s.vision, False)
+        s = spec_of("--max-context", "8192", "--vision", "dynamic")
+        self.assertEqual(page.context_of(list(s.engine_words)), 8192)
+        self.assertEqual(s.vision, "dynamic")
+        page.save(store, {"max_context": 999999})       # longer than the file reads: the default instead
+        self.assertEqual(page.context_of(list(spec_of().engine_words)), 32768)
 
     def test_vision_without_sidecar_is_a_startup_error(self):
         path = self.build(vision=True)

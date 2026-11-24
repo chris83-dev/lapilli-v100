@@ -317,6 +317,27 @@
         <span class="carte__titre">Model and engine</span>
         <dl class="faits" id="faits-moteur"></dl>
       </div>
+      <div class="carte" id="carte-reglages-moteur" hidden>
+        <span class="carte__titre">Engine settings</span>
+        <p class="doux">This server keeps them for this model, for everyone who uses it. Applying restarts the engine;
+          a response being written finishes first.</p>
+        <div class="champ">
+          <label class="champ__libelle" for="m-contexte">Context length <output id="o-m-contexte"></output></label>
+          <select class="entree" id="m-contexte"></select>
+          <span class="doux petit" id="m-contexte-note"></span>
+        </div>
+        <div class="bascule-ligne"><span>Image input<br><span class="doux petit" id="m-vision-note"></span></span>
+          <button class="bascule" id="m-vision" type="button" role="switch" aria-checked="false" aria-label="Image input"></button></div>
+        <div class="carte__pied">
+          <button class="btn btn--accent btn--petit" id="m-appliquer" type="button" disabled>Apply and restart</button>
+          <div class="etat-moteur" id="m-etat-boite" hidden>
+            <svg class="ic" id="m-etat-ic" hidden><use href="web/lapilli-icons.svg#i-succes"/></svg>
+            <span class="petit" id="m-etat" role="status"></span>
+            <button class="btn btn--icone btn--mini" id="m-etat-fermer" type="button" aria-label="Dismiss" title="Close" hidden>
+              <svg class="ic"><use href="web/lapilli-icons.svg#i-croix"/></svg></button>
+          </div>
+        </div>
+      </div>
       <div class="carte">
         <span class="carte__titre">Hardware</span>
         <dl class="faits" id="faits-machine"></dl>

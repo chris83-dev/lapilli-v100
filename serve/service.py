@@ -114,6 +114,11 @@ class Service:
         self.vram_applied: dict | None = None           # the last one applied: {"reserve_mib": ..., "at": ...}
         self.vram_error: str | None = None              # why the last queued one was refused by the engine
         self.vram_worker: threading.Thread | None = None
+        # (Lapilli) the page's Engine settings (serve/engine/settings.py): queued like a resize, applied by a restart
+        self.page_settings: dict | None = None          # set by the server: kept file, the model's length, sources
+        self.settings_queued: dict | None = None        # {"context": N, "vision": "on" | "off"} not yet applied
+        self.settings_state: dict = {"status": "idle"}  # pending, applying, ok, failed (with its error)
+        self.settings_worker: threading.Thread | None = None
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
@@ -488,14 +493,195 @@ class Service:
         """A request waits here while a resize is queued, with keep-alives; False when it was cancelled."""
         while True:
             with self.vram_cv:
-                if self.vram_queued is None:
+                if self.vram_queued is None and self.settings_queued is None:
                     return True
                 self.vram_cv.wait(timeout=QUEUE_BEAT_S)
-                if self.vram_queued is None:
+                if self.vram_queued is None and self.settings_queued is None:
                     return True
             if cancel.is_set():
                 return False
             yield "ping", None
+
+    # ---- (Lapilli) the Engine settings of the server's own page ----
+    def engine_settings(self) -> dict:
+        """GET /api/engine-settings: the context and image input this model runs with, what the page may offer, where
+        each comes from (the command line wins and cannot be changed here), and the last change's state."""
+        from serve.engine import settings as page
+        ps = self.page_settings or {}
+        spawn = getattr(self.engine, "spawn", None)
+        native = ps.get("native_context")
+        ctx = page.context_of(list(spawn[1])) if spawn else None
+        with self.vram_cv:
+            queued = dict(self.settings_queued) if self.settings_queued is not None else None
+            state = dict(self.settings_state)
+        return {"supported": bool(ps) and spawn is not None,
+                "context": {"value": ctx, "serving": getattr(self.engine, "max_context", None) if self.loaded() else None,
+                            "model_max": native, "default": page.default_context(native),
+                            "choices": page.context_choices(native), "source": ps.get("context_source")},
+                "vision": {"value": "on" if self.vision is not None else "off", "available": bool(ps.get("vision_available")),
+                           "source": ps.get("vision_source")},
+                "loaded": self.loaded(), "queued": queued, "state": state}
+
+    def request_engine_settings(self, context=None, vision=None) -> dict:
+        """POST /api/engine-settings: queue a new context and/or image input. Applied by restarting the engine once
+        the running requests have finished (new ones wait meanwhile, as for a resize), kept for the next start; a
+        context the cards cannot hold goes back to the previous settings and says why. ValueError: refused."""
+        from serve.engine import settings as page
+        ps = self.page_settings
+        if not ps or getattr(self.engine, "spawn", None) is None:
+            raise ValueError("this server cannot change its engine settings")
+        job = {}
+        if context is not None:
+            if ps.get("context_source") == "command line":
+                raise ValueError("the context is set on the server's command line (--max-context): change it there")
+            if ps.get("context_source") == "slots":
+                raise ValueError("several slots share the context (--parallel): set --max-context on the command line")
+            job["context"] = page.check_context(context, ps.get("native_context"))
+        if vision is not None:
+            if vision not in ("on", "off"):
+                raise ValueError("vision: on or off")
+            if ps.get("vision_source") == "command line":
+                raise ValueError("image input is set on the server's command line (--vision): change it there")
+            if vision == "on" and not ps.get("vision_available"):
+                raise ValueError("this model file carries no image projector")
+            job["vision"] = vision
+        if not job:
+            raise ValueError("nothing to change: give context and/or vision")
+        with self.vram_cv:
+            self.settings_queued = job
+            self.settings_state = {"status": "pending", "at": int(time.time()), **job}
+            if self.settings_worker is None:
+                self.settings_worker = threading.Thread(target=self._settings_worker, daemon=True)
+                self.settings_worker.start()
+        return {"status": "pending", **job}
+
+    def _settings_worker(self) -> None:
+        """Apply the queued settings at the first gap: the running requests finish, new ones wait (`_vram_gate`)."""
+        try:
+            while not self.stopping.is_set():
+                with self.vram_cv:
+                    job = self.settings_queued
+                    if job is None:
+                        return
+                if self._apply_engine_settings(job, 0.2) is None:
+                    time.sleep(0.05)
+        finally:
+            with self.vram_cv:
+                self.settings_worker = None
+                if self.stopping.is_set():
+                    self.settings_queued = None
+                self.vram_cv.notify_all()
+
+    def _set_engine_vision(self, on: bool, keep=None) -> None:
+        """The server side of the in-engine encoder: `keep` (the previous one) back, a new one, or none."""
+        if not on:
+            self.vision = None
+        elif keep is not None:
+            self.vision = keep
+        elif self.vision is None:
+            from serve.engine.vision import EngineVision
+            v = EngineVision({"mode": "dynamic", "gpu": True})
+            v.attach(self.engine)
+            self.vision = v
+
+    def _apply_engine_settings(self, job: dict, wait: float) -> dict | None:
+        """Restart the engine with the job's settings when the turn and the control lines come free within `wait`
+        seconds and no request runs; None otherwise (the job stays queued). The state says ok or failed."""
+        from serve.engine import settings as page
+
+        def take(lock):
+            return lock.acquire(timeout=wait) if wait else lock.acquire(blocking=False)
+        if not take(self.fifo):
+            return None
+        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+        if ctl is not None and not take(ctl):
+            self.fifo.release()
+            return None
+        done = False
+        try:
+            if self.live_reqs:
+                return None
+            with self.vram_cv:
+                if self.settings_queued is not job:      # replaced meanwhile: the worker takes the newer one
+                    return None
+                self.settings_state = {"status": "applying", "at": int(time.time()), **job}
+            eng = self.engine
+            old_spawn, old_vision = eng.spawn, self.vision
+            args = list(old_spawn[1])
+            if "context" in job:
+                args = page.with_context(args, job["context"])
+            if "vision" in job:
+                args = page.with_vision(args, job["vision"] == "on")
+            was_loaded = self.loaded()
+            what = ", ".join(f"{k} {v}" for k, v in job.items())
+            print(f"[server] engine settings: {what}" + (" (restarting the engine)" if was_loaded else
+                                                         " (applied when the model loads)"), flush=True)
+            if was_loaded:
+                eng.unload()
+            eng.spawn = (old_spawn[0], args) + tuple(old_spawn[2:])
+            if "vision" in job:
+                self._set_engine_vision(job["vision"] == "on")
+            failure = None
+            if was_loaded:
+                tries = self.start_tries
+                self.start_tries = 1                     # a context that does not fit is said at once, not three times
+                try:
+                    self.ensure_loaded()
+                except Exception as e:                   # EngineStartError, GpuBusy, EngineDied: back to what ran
+                    failure = e
+                finally:
+                    self.start_tries = tries
+            if failure is not None:
+                why = str(failure).strip() or type(failure).__name__
+                print(f"[server] warning: engine settings not applied ({why}): back to the previous ones", flush=True)
+                try:
+                    eng.unload()
+                except Exception:
+                    pass
+                eng.spawn = old_spawn
+                if "vision" in job:
+                    self._set_engine_vision(old_vision is not None, old_vision)
+                again = None                             # the previous settings' own failure, if they fail too
+                try:
+                    self.ensure_loaded()
+                except Exception as e2:
+                    again = str(e2).strip() or type(e2).__name__
+                    print(f"[server] warning: the previous engine settings did not start either ({again})", flush=True)
+                # restored: the page says "back on the previous settings" from this field, not from the error's words
+                self.settings_state = {"status": "failed", "error": why, "restored": again is None,
+                                       **({"restore_error": again} if again else {}), "at": int(time.time()), **job}
+                done = True
+                return dict(self.settings_state)
+            if "vision" in job and job["vision"] == "off" and old_vision is not None:
+                try:
+                    old_vision.close()
+                except Exception:
+                    pass
+            ps = self.page_settings
+            kept = page.load(ps["path"])
+            if "context" in job:
+                kept["max_context"] = job["context"]
+                ps["context_source"] = "page"
+            if "vision" in job:
+                kept["vision"] = job["vision"]
+                ps["vision_source"] = "page"
+            note = None
+            try:
+                page.save(ps["path"], kept)
+            except OSError as e:
+                note = f"not kept for the next start ({e})"
+                print(f"[server] warning: engine settings applied, {note}", flush=True)
+            self.settings_state = {"status": "ok", "at": int(time.time()), **job, **({"note": note} if note else {})}
+            done = True
+            return dict(self.settings_state)
+        finally:
+            if ctl is not None:
+                ctl.release()
+            self.fifo.release()
+            with self.vram_cv:
+                if done and self.settings_queued is job:   # a newer one stays queued
+                    self.settings_queued = None
+                self.vram_cv.notify_all()
 
     def vram_state(self) -> dict:
         """The queued and the last applied resize, for /v1/status."""

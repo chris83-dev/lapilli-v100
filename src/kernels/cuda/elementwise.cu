@@ -66,6 +66,14 @@ __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict_
     if (i < n) y[i] = f16_from_f32(x[i]);
 }
 
+__global__ void to_f16_sat_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = x[i];
+    if (v == v) v = fminf(fmaxf(v, -65504.f), 65504.f);   // a NaN fails v == v and goes through as a NaN
+    y[i] = f16_from_f32(v);
+}
+
 __global__ void to_bf16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = bf16_from_f32(x[i]);
@@ -169,6 +177,13 @@ void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     to_f16_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
     check_launch("f32_to_f16_bulk");
     sync_if_needed(stream, "f32_to_f16_bulk");
+}
+
+void f32_to_f16_sat(const float* x, uint16_t* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    to_f16_sat_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
+    check_launch("f32_to_f16_sat");
+    sync_if_needed(stream, "f32_to_f16_sat");
 }
 
 void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {

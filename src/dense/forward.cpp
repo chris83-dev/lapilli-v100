@@ -292,6 +292,43 @@ void prod_swiglu(Model& m, const Linear& gate, const Linear& up, const float* x,
     if (h16) wg::pack(h, gate.rows, gate.rows, T, h16, s);
 }
 
+// (Lapilli, V100) a prompt chunk's NVFP4 products on cuBLAS's FP16 tensor cores (hgemm.hpp) from kHgemmRows rows, MMQ below:
+// measured on the 27B (three passes, alternated), a chunk of 1024 tokens reads in 1.31 s against MMQ's 1.49 (16K: 967
+// against 673 tok/s, 32K: 883 against 630), but one of 256 in 0.73 s against 0.49 and one of 64 in 0.57 s against 0.24 (the
+// whole model's weights are decoded to FP16 for each chunk). A row's bits: the FP16 route keeps them whatever its chunk
+// (ALGO4, dense_hgemm_rows_parity, 9/9 at the 27B's seven shapes); MMQ already does not (0 to 4 of 9 at six shapes: its
+// stream-k split is sized by the chunk), so the threshold adds no new dependence on the chunk. BASALT_DENSE_HGEMM=0: MMQ
+// only; =1: the FP16 route at every chunk size (a row's bits never depend on its chunk); BASALT_DENSE_HGEMM_ROWS=N sets
+// the threshold. Activations in FP16 rows instead of q8_1 blocks: at every size, the 100-block gate KLD 0.02281 against 0.02297.
+constexpr int kHgemmRows = 1024;
+int hgemm_min_rows() {
+    static const int n = [] {
+        const char* e = std::getenv("BASALT_DENSE_HGEMM");
+        if (e != nullptr && e[0] == '0') return -1;                        // off
+        if (e != nullptr && e[0] == '1') return 1;                         // every chunk size
+        const char* r = std::getenv("BASALT_DENSE_HGEMM_ROWS");
+        const int v = r ? std::atoi(r) : 0;
+        return v > 0 ? v : kHgemmRows;
+    }();
+    return n;
+}
+bool hgemm_route(Model& m, int type, int64_t cols, int T) {
+    const int min_rows = hgemm_min_rows();
+    if (type != kTypeNvfp4 || min_rows < 0 || T < min_rows || cols % 256 != 0 || fp4_hardware()) return false;
+    if (!m.hg) {
+        const Geometry& g = m.g;
+        const int64_t widest = std::max<int64_t>({(int64_t) g.n_embd * 2, (int64_t) g.n_ff, (int64_t) g.value_width(),
+                                                  (int64_t) g.n_head * g.head_dim});
+        int64_t w_elems = 0;
+        for (const Layer& L : m.w.layers)
+            for (const Linear* l : {&L.qkv, &L.z, &L.out, &L.q, &L.k, &L.v, &L.o, &L.gate, &L.up, &L.down})
+                if (l->type == kTypeNvfp4) w_elems = std::max<int64_t>(w_elems, l->rows * l->cols);
+        m.hg = std::make_unique<Hgemm>();
+        m.hg->ready((size_t) kChunk * (size_t) widest, (size_t) std::max<int64_t>(w_elems, widest * 256));
+    }
+    return m.hg->usable();
+}
+
 // y [T][rows] = W . x from chunk_act's activations: on MMQ, or for F8 and NVFP4 planes on the FP8 / FP4 tensor cores with
 // the tensor scale applied
 void gemm(Model& m, const Linear& l, float* y, int T, cudaStream_t s) {
@@ -302,6 +339,10 @@ void gemm(Model& m, const Linear& l, float* y, int T, cudaStream_t s) {
     }
     if (l.type == kTypeNvfp4Planes) {
         prefill::fp4_dense::product(l.w, l.scale, l.rows, l.cols, m.cs.a4, m.cs.gs, T, y, l.rows, false, s);
+        return;
+    }
+    if (hgemm_route(m, l.type, l.cols, T)) {   // the activations chunk_act left in the FP16 image
+        m.hg->product(l.w, l.rows, l.cols, y, l.rows, T, s);
         return;
     }
     prefill::mmq::Product p;
@@ -345,6 +386,7 @@ void chunk_act(Model& m, const float* x, int type, int64_t cols, int T, cudaStre
     ChunkScratch& b = m.cs;
     if (type == kTypeF8) prefill::fp8::quantize(x, T, cols, cols, b.xq, s);
     else if (type == kTypeNvfp4Planes) prefill::fp4_dense::quantize(x, T, cols, cols, b.a4, b.gs, s);
+    else if (hgemm_route(m, type, cols, T)) m.hg->act(x, T, cols, s);
     else prefill::mmq::quantize(x, nullptr, b.xq, type, cols, cols, T, s);
 }
 

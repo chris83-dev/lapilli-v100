@@ -5,6 +5,7 @@
 #include "basalt/kernels/window_gemm.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
+#include "hgemm.hpp"
 
 #include <cuda_runtime.h>
 
@@ -138,6 +139,7 @@ public:
     cudaStream_t stage_side = nullptr;
     cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;
+    std::unique_ptr<Hgemm> hg;                   // (Lapilli, V100) the prompt chunks' NVFP4 products on FP16 (hgemm.hpp)
     int lb = 0, le = 0;                          // the layers this card runs: [lb, le)
     int n_gdn = 0, n_attn = 0;                   // the GDN and attention layers among them
     std::vector<int> gdn_index, attn_index;      // per layer: its index among the card's GDN or attention layers (-1)

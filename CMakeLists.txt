@@ -335,9 +335,11 @@ endif()
 if(BASALT_MODEL_QWEN35)
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it
-add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp src/dense/split_plan.cpp)
+add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp src/dense/split_plan.cpp
+            src/dense/hgemm.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
-target_link_libraries(dense PUBLIC model kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
+target_link_libraries(dense PUBLIC model kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target}
+                      ${_gpu_blas_target})
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
 target_include_directories(model_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src PRIVATE ${_gpu_include_directories})
 target_link_libraries(model_qwen35 PUBLIC model tokenizer dense core ${_gpu_runtime_target})
@@ -987,6 +989,14 @@ add_executable(gqa_attn_parity tests/kernels/gqa_attn_parity.cpp)
 target_link_libraries(gqa_attn_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gqa_attn_parity COMMAND gqa_attn_parity)
 set_tests_properties(gqa_attn_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+if(TARGET dense)
+  # (Lapilli, V100) the prompt chunks' NVFP4 products on cuBLAS's FP16 tensor cores keep a row's bits whatever its chunk
+  add_executable(dense_hgemm_rows_parity tests/dense/hgemm_rows_parity.cpp)
+  target_include_directories(dense_hgemm_rows_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${_gpu_include_directories})
+  target_link_libraries(dense_hgemm_rows_parity PRIVATE dense ${_gpu_runtime_target})
+  basalt_gpu_test(NAME dense_hgemm_rows_parity COMMAND dense_hgemm_rows_parity)
+  set_tests_properties(dense_hgemm_rows_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+endif()
 # a cache split in two places (K/V streaming): every attention kernel and the cache writes bitwise their one-buffer launches
 add_executable(gqa_far_parity tests/kernels/gqa_far_parity.cpp)
 target_link_libraries(gqa_far_parity PRIVATE kernels ${_gpu_runtime_target})

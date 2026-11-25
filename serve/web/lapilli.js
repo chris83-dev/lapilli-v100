@@ -170,6 +170,7 @@ async function lireSante() {
     const joindre = sante.images ? "Attach a text file or an image (or drop them here, or paste a screenshot)" : "Attach a text file (or drop it here)";
     $("btn-joindre").title = joindre;
     $("btn-joindre").setAttribute("aria-label", sante.images ? "Attach a text file or an image" : "Attach a text file");
+    mesurerGarde();    // whether this model keeps earlier thinking in its context
   } catch (e) {
     setTimeout(lireSante, 3000);
   }
@@ -381,6 +382,47 @@ $("m-appliquer").onclick = async () => {
   lireReglagesMoteur();
 };
 
+// ------------------------------------------------------------------ a newer page on the server
+// The server reads its page files at each request: a tab opened before an update keeps running the old code until it is
+// reloaded (seen: a test made on the page from before a fix, the tab open since the night before). The page
+// compares the files it was given with the ones the server gives now: once at start (the reference), every five
+// minutes, when the tab comes back, and when the server restarts. When they differ, a notice offers to reload, never
+// while a response or a compaction is being written. Closed, it comes back only for a newer change.
+const FICHIERS_PAGE = ["./", "web/lapilli.js", "web/lapilli-monitor.js", "web/lapilli.css"];
+let empreintePage = null, empreinteNeuve = null, empreinteFermee = null, verifPage = 0, verifEnVol = false, depuisServeur = null, avisPage = null;
+function empreinte(texte) {                       // FNV-1a on 32 bits: enough to tell two versions of the page apart
+  let h = 0x811c9dc5;
+  for (let i = 0; i < texte.length; i++) { h ^= texte.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(16);
+}
+async function verifierPage() {
+  if (verifEnVol) return;
+  verifEnVol = true;
+  verifPage = Date.now();
+  try {
+    const textes = await Promise.all(FICHIERS_PAGE.map(async (f) => {
+      const r = await fetch(f, {cache: "no-store"});
+      if (!r.ok) throw new Error(`${f}: ${r.status}`);
+      return r.text();
+    }));
+    const e = empreinte(textes.join("\n|\n"));
+    if (empreintePage === null) empreintePage = e;
+    else if (e !== empreintePage) { empreinteNeuve = e; montrerAvisPage(); }
+  } catch (err) { /* the server is restarting or out of reach: the next check tells */ }
+  verifEnVol = false;
+}
+function montrerAvisPage() {
+  if (!empreinteNeuve || empreinteNeuve === empreinteFermee || (avisPage && avisPage.isConnected)) return;
+  if (enCours || compactage) return;              // shown once the response is done (montrerAvisPage at its end)
+  const vue = empreinteNeuve;
+  avisPage = annonce("info", "This page was updated", "Reload to use the new version. Your conversations stay in this browser.", 0,
+                     {libelle: "Reload", faire: () => location.reload()});
+  // closed by its cross: it comes back only when the server gives yet another version
+  avisPage.querySelector(".annonce__actions .btn--icone").addEventListener("click", () => { empreinteFermee = vue; });
+}
+setInterval(() => { if (!document.hidden) verifierPage(); }, 300000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden && Date.now() - verifPage > 15000) verifierPage(); });
+
 // ------------------------------------------------------------------ metrics (/metrics), every second
 let mesures = null, echecs = 0, cleAvertie = false, minuterieReleve = null, releveEnVol = false, releverEncore = false;
 async function relever() {
@@ -399,6 +441,10 @@ async function relever() {
     } else {
       const avant = mesures;
       mesures = await r.json();
+      // a server that restarted may serve a newer page
+      const depuis = mesures.totals && mesures.totals.since;
+      if (depuis && depuisServeur && depuis !== depuisServeur) verifierPage();
+      if (depuis) depuisServeur = depuis;
       // the engine has just loaded again, or serves another context (Engine settings applied, from this page or
       // another): /health again, for the length steps and the attach button
       const chargeait = avant && avant.live && avant.live.state === "loading";
@@ -409,6 +455,7 @@ async function relever() {
       if (echecs >= 3) annonce("succes", "Server reachable again", "", 3000);
       echecs = 0;
       dessinerMesures(mesures);
+      if (enCours) dessinerJauge();                  // the gauge follows the response being written
     }
   } catch (e) {
     if (++echecs === 3) { poserPastille("horsligne", "Server unreachable"); if (enCours) activite(); }
@@ -584,6 +631,8 @@ function enHtml(texte) {
 const MAX_CONVS = 60;
 let convs = memoire.lire("conversations", []);
 if (!Array.isArray(convs)) convs = [];
+// a compaction interrupted by a closed page left an empty node: it carries no summary, it goes
+for (const c of convs) if (c && Array.isArray(c.messages)) c.messages = c.messages.filter((m) => !(m.role === "compaction" && m.genre !== "reflexion" && !String(m.texte || "").trim()));
 let courante = memoire.lire("courante", null);
 if (!convs.some((c) => c.id === courante)) courante = null;
 const convCourante = () => convs.find((c) => c.id === courante) || null;
@@ -641,6 +690,7 @@ function choisirConv(id) {
   courante = id;
   memoire.ecrire("courante", courante);
   dessinerConvs(); dessinerFil();
+  compterPensees(convCourante());                   // a conversation from before the count: its thinking, in tokens
   if (etroit()) ouvrirConvs(false);
   if (!estTactile()) $("saisie").focus();
 }
@@ -684,8 +734,561 @@ $("voile-convs").onclick = () => ouvrirConvs(false);
 matchMedia("(max-width: 960px)").addEventListener("change", () => ouvrirConvs(etroit() ? false : memoire.lire("panneau", true)));
 
 // ------------------------------------------------------------------ the thread
+// ------------------------------------------------------------------ conversation compaction
+// After llama.cpp's own web UI (ui/apps/chat: utils/compaction.ts, constants/compaction.constants.ts, compactConversation),
+// where the compaction lives in the chat page, not in the engine: the model summarizes what lies before the last steps,
+// the summary is kept in a node appended to the conversation, and later requests read that summary, framed, then the
+// steps the compaction kept as written, then what followed. The whole history stays on screen. With it, the automatic
+// trigger of our llama.cpp interface: before a message is sent, once the context reaches a threshold.
+// What this engine adds to it. Its main model's template keeps the thinking of earlier turns in the prompt
+// (the page sends it back so that the server recognizes what it has read), and with long thinking the context fills with
+// thinking before it fills with text: five short puzzles hold 8,130 tokens, 7,242 of them thinking, 938 without it. So a
+// lighter compaction comes first, which only leaves that thinking out (no summary, every message stays as written); the
+// steps kept as written go without their thinking and are bounded by a share of the context; the automatic trigger also
+// keeps room for a response; and a response the context cut says what to do, and never leaves the conversation stuck.
+const COMPACTION = {
+  GABARIT: "This conversation was compacted. Summary of the earlier exchange:\n\n",
+  CONSIGNE: "Summarize this conversation so it can seamlessly continue in a fresh context. Capture: the overall goal, key facts and decisions, the current state of any ongoing work (including code, file names, and data discussed), and what remains to be done. Write the summary as dense prose addressed to the assistant that will resume the conversation. Return ONLY the summary, nothing else.",
+  CAR_PAR_JETON: 3,            // rough characters per token, to count a message before the server does
+  PLEIN: "The context is too full for a summary. Make it longer under About, or start a new conversation.",
+  CONVERSATION: "The conversation no longer fits in the model's context. Make it longer under About, or start a new conversation.",
+  // ours, for an engine whose main model keeps the thinking of earlier turns in its context: there a step can
+  // weigh thousands of tokens, and the context fills with thinking before it fills with text
+  PART_GARDEE: 0.5,            // the steps a compaction keeps as written weigh at most this share of the context: the
+                               // last response is often the work in progress (a whole file), a summary would lose it
+  ECART_MINI: 0.1,             // when neither compaction makes enough room, the summary is chosen over leaving the thinking
+                               // out only if it leaves this share of the context less
+  GAIN_MINI: 0.02,             // leaving the earlier thinking out is worth it from this share of the context
+  RESUME_PREVU: 512,           // what a summary is expected to weigh, when choosing between the two compactions
+  POIDS_IMAGE: 1000,           // rough weight of an image in a kept step: its true size is only known once read
+  REESSAI_MINI: 0.2,           // asking again after a compaction is offered when it frees this share of the context
+  // The server's /tokenize is exact and fast (measured on the server's machine: 13 ms for 76,000 characters, 21 ms for 152,000;
+  // the 21 s first written here were a slow link to it, not the server). Asked up to this length; above it, the
+  // measured average of the model's own thinking, 3.3 characters a token
+  COMPTE_MAXI: 200000, CAR_PAR_JETON_MESURE: 3.3,
+  SUITES_MAX: 3,               // automatic continuations of one response the context cut
+  MARGE_REPONSE: 1.5,          // the room kept for a response: the longest so far and half as much again (its thinking varies)
+};
+let compactage = null;         // {controleur, c, noeud, debut, phase} while a summary is being written
+const elementsCompaction = new WeakMap();
+const estNoeud = (m) => !!m && m.role === "compaction";
+// two kinds of node: a summary (an empty one is an interrupted compaction), or the earlier thinking left out (no text)
+const estAllege = (m) => estNoeud(m) && m.genre === "reflexion";
+// the conversation's last message that is not a compaction node: a response continued after its compaction
+// sits before its node and is still the last one; -1 without any
+function dernierVrai(c) {
+  if (c) for (let i = c.messages.length - 1; i >= 0; i--) if (!estNoeud(c.messages[i])) return i;
+  return -1;
+}
+const estBorne = (m) => estNoeud(m) && !estAllege(m) && !!String(m.texte || "").trim();
+// Whether this model's chat template keeps the thinking of earlier turns in the prompt (mesurerGarde): true for Qwen's
+// and Inkling's, false for DeepSeek's; null while not measured.
+let gardeReflexion = null, gardePour = "";
+// What the model reads (sliceAtLastCompaction): everything without a node; with a summary node, that node, the steps it
+// kept right before it, then what follows it. A step is a message of the user or a response. Before the last
+// node of either kind, a response goes without its thinking: a copy, the thread keeps it.
+function vueModele(messages) {
+  let borne = -1, allege = -1;
+  for (let i = messages.length - 1; i >= 0 && borne < 0; i--) {
+    const m = messages[i];
+    if (compactage && compactage.noeud === m) continue;
+    if (estBorne(m)) borne = i;
+    else if (allege < 0 && estAllege(m)) allege = i;
+  }
+  const sans = Math.max(borne, allege);
+  const etape = (m, i) => (i < sans && m.role === "assistant" && m.reflexion ? {...m, reflexion: "", sansReflexion: true} : m);
+  const etapes = (de, a) => { const out = []; for (let i = de; i < a; i++) if (!estNoeud(messages[i])) out.push(etape(messages[i], i)); return out; };
+  if (borne < 0) return etapes(0, messages.length);
+  const avant = etapes(0, borne);
+  const gardes = Math.min(Math.max(0, messages[borne].gardes || 0), avant.length);
+  return [messages[borne], ...(gardes > 0 ? avant.slice(avant.length - gardes) : []), ...etapes(borne + 1, messages.length)];
+}
+// thinking tokens of a response: the pieces received while it was written, or the server's count of its text (a
+// response from before these counts: its characters, at the measured average)
+const penseDe = (m) => (!m.reflexion ? 0 : m.pense != null ? m.pense : Math.ceil(m.reflexion.length / COMPACTION.CAR_PAR_JETON_MESURE));
+// rough weight of a step sent without its thinking: what the server wrote less that thinking, else its characters
+function poidsEtape(m) {
+  if (m.role === "assistant" && m.ecrits != null && !aDesOutils(m)) {
+    const pense = m.reflexion || m.sansReflexion ? m.pense : 0;
+    if (pense != null) return Math.max(0, m.ecrits - pense) + 8;
+  }
+  const car = String(m.texte || "").length + (m.fichiers || []).reduce((n, f) => n + String(f.texte || "").length + 40, 0)
+    + (aDesOutils(m) ? m.outils.reduce((n, o) => n + String(o.nom || "").length + String(o.args || "").length + 40, 0) : 0);
+  return Math.ceil(car / COMPACTION.CAR_PAR_JETON) + 8 + (m.images || []).length * COMPACTION.POIDS_IMAGE;
+}
+// Where a compaction cuts that view (compactionCut), and the steps it keeps as written: the last ones, up to the number
+// set, as far as they fit in a share of the context. Null when nothing lies before the kept steps.
+function coupeCompaction(vue, garder, budget) {
+  const debuts = [];
+  vue.forEach((m, i) => { if (!estNoeud(m)) debuts.push(i); });
+  let gardes = 0, poids = 0;
+  while (gardes < Math.min(garder, debuts.length)) {
+    const p = poidsEtape(vue[debuts[debuts.length - 1 - gardes]]);
+    if (budget != null && poids + p > budget) break;
+    poids += p; gardes++;
+  }
+  if (debuts.length - gardes < 1) return null;
+  return {index: gardes > 0 ? debuts[debuts.length - gardes] : vue.length, gardes, poids};
+}
+const etapesGardees = () => { const n = Math.floor(+reglages.compactionEtapes); return Number.isFinite(n) && n >= 0 ? n : DEFAUTS.compactionEtapes; };
+const budgetGarde = () => { const t = +sante.max_context || 0; return t > 0 ? Math.floor(t * COMPACTION.PART_GARDEE) : null; };
+// The thinking a light compaction takes out of the context, in tokens: every earlier response's when this model's
+// template keeps it; the last response's only while that is not measured (that one is in the context for sure); none
+// when the template drops it by itself at the next turn (contexteUtilise then counts without it).
+function gainAllegement(vue) {
+  if (gardeReflexion === false) return 0;
+  let dernier = -1;
+  vue.forEach((m, i) => { if (m.role === "assistant") dernier = i; });
+  let gain = 0;
+  vue.forEach((m, i) => { if (m.role === "assistant" && m.reflexion && (gardeReflexion || i === dernier)) gain += penseDe(m); });
+  return gain;
+}
+// the room a response is expected to need: the longest this conversation still holds, thinking included, with a margin
+// ("Room kept for the next response") thinking included ("reponse", the default), or its text
+// only ("texte"): a thinking adapts to the room left (the server stops it at three quarters of it), its text does not
+const placeDe = (m) => (reglages.compactionPlace === "texte" ? poidsEtape(m) : m.ecrits);
+const plusLongueReponse = (vue) => Math.ceil(vue.reduce((n, m) => {
+  if (m.role !== "assistant" || m.ecrits == null) return n;
+  const v = placeDe(m);
+  return v > n ? v : n;
+}, 0) * COMPACTION.MARGE_REPONSE);
+// The context this conversation holds for its next message: what its last response read and wrote (less its thinking
+// when this model's template drops it at the next turn), or what a compaction left (computed, until a response measures it).
+// The latest measure of the context: the last response that was measured, or a compaction node after it. A
+// response continued after its compaction sits BEFORE its node yet was measured after it: the newer of the two counts.
+function derniereMesure(messages) {
+  let noeud = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "assistant" && m.lus != null) return noeud && !((m.mesureA || 0) > (noeud.temps || 0)) ? noeud : m;
+    if (!noeud && (estBorne(m) || estAllege(m))) noeud = m;
+  }
+  return noeud;
+}
+function contexteUtilise(c, messages = c && c.messages) {
+  if (!c || !messages) return null;
+  const m = derniereMesure(messages);
+  if (!m) return null;
+  if (estNoeud(m)) return m.apres != null ? m.apres : null;
+  // a continued response: its earlier text is in what its last request read; its last request wrote the rest
+  return Math.max(0, m.lus + (m.ecritsDernier ?? m.ecrits ?? 0) - (gardeReflexion === false ? (m.penseDernier ?? penseDe(m)) : 0));
+}
+// that context is an estimate while it comes from a compaction: the next response measures it
+function contexteEstime(c) {
+  const m = c ? derniereMesure(c.messages) : null;
+  return !m ? false : estNoeud(m) ? m.apres != null : !!m.compteEstime;
+}
+// What a compaction would do now, or null: {genre: "reflexion" (the earlier thinking left out) or "resume" (a summary),
+// apres: the context it is expected to leave}. Before a message ("auto", after our llama.cpp interface): nothing while
+// the context has room, that is under the threshold, in percent of its size, and with room left for a response
+// half as long again as the longest so far; otherwise the lightest compaction that makes that room, the thinking first:
+// it costs no summary and every message stays as written. By hand ("manuel"): the same choice when room is short; with room, a
+// summary when steps lie before the kept ones, else the thinking left out. `besoin`: what a response is known to need
+// at least (one the context cut).
+function planCompaction(c, mode, arrivant = 0, messages = c && c.messages, besoin = 0, connu = null) {
+  if (!c || !messages) return null;
+  const total = +sante.max_context || 0;
+  const vue = vueModele(messages);
+  const coupe = coupeCompaction(vue, etapesGardees(), budgetGarde());
+  const gain = gainAllegement(vue);
+  // `connu`: the context these messages hold when something else measured it (the server's count in its refusal)
+  const utilise = connu != null ? connu : contexteUtilise(c, messages), pct = +reglages.compactionSeuil;
+  const leger = total > 0 && gain >= total * COMPACTION.GAIN_MINI ? {genre: "reflexion", gain, avant: utilise, apres: utilise != null ? Math.max(0, utilise - gain) : null} : null;
+  // A summary is expected to weigh what the last one of this conversation did (they grow with the work: 2,683 tokens at
+  // the sixth of a real session), else a usual size. It is worth it only if it leaves clearly less than there is now:
+  // seen on Hy4-flash, which drops earlier thinking by itself, a 500-token message summarized for nothing (3,884 → 3,984).
+  const prevu = estNoeud(vue[0]) && vue[0].ecrits ? Math.max(vue[0].ecrits, COMPACTION.RESUME_PREVU / 2) : COMPACTION.RESUME_PREVU;
+  // the summary request carries what lies before the kept steps (without thinking), the instruction, and room for
+  // the summary: when that cannot fit, there is no summary to make (seen at 8,192: one continued answer whose text alone
+  // filled the context; the request was refused, then the message, then its rescue)
+  let tient = !!coupe;
+  if (coupe && total > 0) {
+    let lu = 100 + Math.min(COMPACTION.RESUME_PREVU, total / 8);
+    for (let i = 0; i < coupe.index; i++) lu += poidsEtape(vue[i]);
+    tient = lu <= total;
+  }
+  const plein = coupe && tient && (utilise == null || !(total > 0) || utilise - (coupe.poids + prevu) >= total * COMPACTION.GAIN_MINI)
+    ? {genre: "resume", coupe, avant: utilise, apres: coupe.poids + prevu} : null;
+  const auChoix = mode === "auto" ? null : plein || leger;
+  if (!(total > 0) || utilise == null || !Number.isFinite(pct) || pct <= 0) return auChoix;
+  const seuil = (total * Math.min(pct, 100)) / 100, reserve = Math.max(plusLongueReponse(vue), Math.ceil(besoin * COMPACTION.MARGE_REPONSE));
+  const serre = (u) => u + arrivant >= seuil || u + arrivant + reserve > total;
+  if (!serre(utilise)) return auChoix;
+  if (leger && !serre(leger.apres)) return leger;
+  if (plein && (!leger || !serre(plein.apres))) return plein;
+  // neither makes enough room: the one that leaves clearly less, else the thinking (every message stays as written)
+  return plein && leger && plein.apres < leger.apres - total * COMPACTION.ECART_MINI ? plein : leger || plein;
+}
+async function lireFlux(r, surObjet) {          // the objects of a streamed answer, one per "data:" line
+  const lecteur = r.body.getReader(), dec = new TextDecoder();
+  let tampon = "";
+  const traiter = (ligne) => {
+    if (!ligne.startsWith("data:")) return;
+    const donnee = ligne.slice(5).trim();
+    if (!donnee || donnee === "[DONE]") return;
+    let j;
+    try { j = JSON.parse(donnee); } catch (e) { return; }
+    surObjet(j);
+  };
+  for (;;) {
+    const {value, done} = await lecteur.read();
+    if (done) break;
+    tampon += dec.decode(value, {stream: true});
+    let k;
+    while ((k = tampon.indexOf("\n")) >= 0) { const ligne = tampon.slice(0, k).trim(); tampon = tampon.slice(k + 1); traiter(ligne); }
+  }
+  tampon += dec.decode();
+  if (tampon.trim()) traiter(tampon.trim());
+}
+// how many tokens the server counts in a text (its /tokenize, no engine work); null when it cannot say. A text past
+// COMPACTION.COMPTE_MAXI is estimated instead.
+async function compterJetons(texte, signal) {
+  if (texte.length > COMPACTION.COMPTE_MAXI) return Math.ceil(texte.length / COMPACTION.CAR_PAR_JETON_MESURE);
+  const r = await fetch("tokenize", {method: "POST", headers: entetes(true), body: JSON.stringify({content: texte}), signal});
+  if (!r.ok) return null;
+  const j = await r.json();
+  return Array.isArray(j.tokens) ? j.tokens.length : null;
+}
+const modeleServi = () => (mesures && mesures.engine && mesures.engine.model) || sante.model || "flash-next";
+// Whether this model's template keeps the thinking of earlier turns, measured without the engine: the server
+// counts the same short conversation with and without a thinking block (its token count route).
+async function mesurerGarde() {
+  const modele = modeleServi();
+  if (gardePour === modele) return;
+  gardePour = modele; gardeReflexion = null;
+  const pense = "The user greets me. A short greeting back is all that is needed here. ".repeat(4);
+  const compte = async (avec) => {
+    const r = await fetch("v1/messages/count_tokens", {method: "POST", headers: entetes(true), body: JSON.stringify({model: modele, messages: [
+      {role: "user", content: "Hello."},
+      {role: "assistant", content: [...(avec ? [{type: "thinking", thinking: pense, signature: ""}] : []), {type: "text", text: "Hello."}]},
+      {role: "user", content: "And again."}]})});
+    if (!r.ok) return null;
+    const j = await r.json();
+    return Number.isFinite(+j.input_tokens) ? +j.input_tokens : null;
+  };
+  let garde = null;
+  try {
+    const [a, s] = await Promise.all([compte(true), compte(false)]);
+    if (a != null && s != null) garde = a - s > 16;
+  } catch (e) { /* not measured: the cautious counts apply */ }
+  if (gardePour !== modele) return;                 // another model came meanwhile: its own measure follows
+  if (garde === null) gardePour = "";               // asked again at the next reading of the server's state
+  gardeReflexion = garde;
+  dessinerJauge(); majDernierMessage();
+}
+// The thinking of each response of a conversation, in tokens as the server counts its text: where it was only counted
+// from the pieces received (within a few tokens of it: 5,726 for 5,728, 4,272 for 4,284), or not at all (a conversation
+// from before these counts).
+async function compterPensees(c) {
+  const manque = (c ? c.messages : []).filter((m) => m.role === "assistant" && m.reflexion && m.reflexion.length <= COMPACTION.COMPTE_MAXI
+    && (m.pense == null || m.penseDesMorceaux));
+  if (!manque.length) return;
+  await Promise.all(manque.map(async (m) => {
+    try { const n = await compterJetons(m.reflexion); if (n != null) { m.pense = n; delete m.penseDesMorceaux; } } catch (e) { /* the count it has stays */ }
+  }));
+  garderConvs(); dessinerJauge(); majDernierMessage();
+}
+// tokens of a step's text as a request carries it, without its thinking
+async function jetonsEtape(m, signal) {
+  if (m.role === "assistant" && m.ecrits != null && !aDesOutils(m)) {
+    const pense = m.reflexion || m.sansReflexion ? m.pense : 0;
+    if (pense != null) return Math.max(0, m.ecrits - pense);
+  }
+  const texte = m.role === "user" ? [m.texte, ...(m.fichiers || []).map(blocFichier)].filter((x) => x).join("\n\n")
+    : [m.texte || "", ...(aDesOutils(m) ? m.outils.map((o) => `${o.nom || ""} ${o.args || ""}`) : [])].join("\n");
+  return texte ? compterJetons(texte, signal) : 0;
+}
+// Compacts the conversation (compactConversation): "ok", "echec" (the node is gone, an announcement says why), "arrete"
+// (stopped by hand) or "rien" (nothing to compact). `attente`: the message of the user that waits for it, shown after the
+// node. `plan`: what to do (planCompaction), by hand when not given.
+async function compacter(c, attente = null, plan = planCompaction(c, "manuel")) {
+  if (!c || enCours || compactage || !plan) return "rien";
+  if (plan.genre === "reflexion") {                 // nothing to write: the node says it, the requests that follow go without that thinking
+    const avant = plan.avant != null ? plan.avant : contexteUtilise(c);
+    c.messages.push({role: "compaction", genre: "reflexion", texte: "", avant, apres: avant != null ? Math.max(0, avant - plan.gain) : null, temps: Date.now()});
+    if (attente) c.messages.push(attente);
+    c.modifie = Date.now();
+    garderConvs(); dessinerConvs(); dessinerFil();
+    return "ok";
+  }
+  const source = vueModele(c.messages);
+  const coupe = coupeCompaction(source, etapesGardees(), budgetGarde());
+  if (coupe === null) return "rien";
+  const noeud = {role: "compaction", texte: "", gardes: coupe.gardes, avant: plan.avant != null ? plan.avant : contexteUtilise(c), apres: null, temps: Date.now()};
+  c.messages.push(noeud);
+  if (attente) c.messages.push(attente);
+  const controleur = new AbortController();
+  compactage = {controleur, c, noeud, debut: performance.now(), phase: "lecture"};
+  suivre = true;
+  occupe(true);
+  c.modifie = Date.now();
+  dessinerConvs(); dessinerFil();
+  const minuterie = setInterval(() => majCompaction(noeud), 250);
+  relever();
+  let fin = null, usage = null, erreur = "", arrete = false;
+  const consigne = String(reglages.compactionConsigne || "").trim() || COMPACTION.CONSIGNE;
+  try {
+    // What lies before the kept steps, then the instruction. Ours: without the thinking of those steps and
+    // without thinking of its own. A compaction comes when room is short: this is the smallest request that carries
+    // the conversation, and its answer is the summary alone (llama.cpp sends the chat's own options and so reuses its
+    // cache; here the thinking asked changes the very start of the prompt, and what the server has read with it).
+    const corps = {model: modeleServi(), stream: true, reasoning_effort: "none",
+                   messages: [...messagesDe(source.slice(0, coupe.index), true), {role: "user", content: consigne}]};
+    if (reglages.temperature != null) corps.temperature = reglages.temperature;
+    if (reglages.temperature !== 0) {
+      if (reglages.top_p != null) corps.top_p = reglages.top_p;
+      if (reglages.top_k != null) corps.top_k = reglages.top_k;
+    }
+    const r = await fetch("v1/chat/completions", {method: "POST", headers: entetes(true), body: JSON.stringify(corps), signal: controleur.signal});
+    if (!r.ok) throw await refus(r);
+    await lireFlux(r, (j) => {
+      if (j.error) throw new Error(j.error.message || "The engine reported an error.");
+      if (j.usage) usage = j.usage;
+      const ch = (j.choices && j.choices[0]) || {};
+      if (ch.finish_reason) fin = ch.finish_reason;
+      const d = ch.delta || {};
+      if (d.reasoning_content && compactage.phase !== "ecriture") compactage.phase = "reflexion";
+      if (d.content) { noeud.texte += d.content; compactage.phase = "ecriture"; }
+    });
+    if (fin === "length") throw new Error(COMPACTION.PLEIN);   // a summary the limit cut is no summary
+    if (!noeud.texte.trim()) throw new Error("The model returned no summary.");
+  } catch (e) {
+    if (e.name === "AbortError") arrete = true;
+    // the server refused the summary request for lack of room: said with what to do about it
+    else erreur = e.statut === 400 && /context/i.test(`${e.code} ${e.detail}`) ? COMPACTION.PLEIN : String(e.message || e);
+  }
+  const resume = !arrete && !erreur;
+  if (!resume) {                                    // an interrupted compaction leaves no node behind
+    const k = c.messages.indexOf(noeud);
+    if (k >= 0) c.messages.splice(k, 1);
+  } else {
+    noeud.texte = noeud.texte.trim();
+    noeud.ecrits = usage ? usage.completion_tokens : null;
+    noeud.duree = (performance.now() - compactage.debut) / 1000;
+    // The size of the reduced context, computed: the framed summary and the kept steps without their thinking, as the
+    // server counts their text (/tokenize, no engine work), plus the template's own tokens around each message.
+    // llama.cpp reads the reduced context again instead (its pre-encode), which also leaves its server ready; here the
+    // message that waits reads it anyway, and that response then gives the measure. No number when a kept step carries
+    // an image: its size is only known once read.
+    try {
+      const gardees = source.slice(coupe.index);
+      if (!gardees.some((m) => (m.images || []).length)) {
+        const comptes = await Promise.all([compterJetons(COMPACTION.GABARIT + noeud.texte, controleur.signal), ...gardees.map((m) => jetonsEtape(m, controleur.signal))]);
+        // (7 tokens of template around each message, measured: 245 read for 223 of text in 3 messages on the 27B, 208 for 182 on Flash-Next)
+        if (comptes.every((n) => n != null)) noeud.apres = comptes.reduce((a, b) => a + b, 0) + 7 * comptes.length + 1;
+      }
+    } catch (e) {
+      if (e.name === "AbortError") arrete = true;     // the summary stays; its size will follow the next response
+    }
+  }
+  clearInterval(minuterie);
+  compactage = null;
+  occupe(false);
+  c.modifie = Date.now();
+  garderConvs(); dessinerConvs(); dessinerFil(); relever();
+  if (erreur) annonce("erreur", "Compaction failed", erreur, 9000);
+  if (!attente) montrerAvisPage();                  // a newer page seen meanwhile (a waiting message: after its response)
+  return arrete ? "arrete" : resume ? "ok" : "echec";
+}
+// The server refused a message because the conversation no longer fits (the page did not know its size: a
+// conversation from before these counts, an image, a response without its final count). The refusal says what the
+// request weighs, the server's own count: the compaction that makes room for it, then the message again, once. False
+// when nothing can be dropped: the refusal then shows as it is.
+async function rattraper(c, m, lu) {
+  const k = c.messages.indexOf(m), question = k >= 1 ? c.messages[k - 1] : null;
+  if (!question || question.role !== "user") return false;
+  const avant = c.messages.slice(0, k - 1);
+  const car = String(question.texte || "").length + (question.fichiers || []).reduce((n, f) => n + String(f.texte || "").length, 0);
+  const arrivant = Math.ceil(car / COMPACTION.CAR_PAR_JETON);
+  const plan = planCompaction(c, "auto", arrivant, avant, 0, lu != null ? Math.max(0, lu - arrivant) : +sante.max_context || null);
+  if (!plan) return false;
+  c.messages.length = k - 1;                        // the refused response goes; its message waits after the node
+  const fait = await compacter(c, question, plan);
+  if (!c.messages.includes(question)) c.messages.push(question);
+  if (fait !== "ok") {
+    c.messages.push(m);
+    c.modifie = Date.now();
+    garderConvs(); dessinerFil();
+    return false;
+  }
+  demander(c, true);
+  return true;
+}
+// A response the context cut, with text written, can go on (the server continues a final assistant message,
+// as llama.cpp's prefill-assistant): its own thinking leaves the context (the continuation is text) and, when this model
+// keeps earlier turns' thinking, theirs too: the light compaction, its node placed after the response. Null when that
+// does not leave a fifth of the context for the rest of it, or the response cannot be continued.
+const coupeeParContexte = (m) => !m.limite || !!m.pleinMoteur || (m.ecrits != null && m.ecrits < m.limite);
+function continuable(c, m) {
+  const k = c ? c.messages.indexOf(m) : -1;
+  return k >= 1 && k === dernierVrai(c) && m.role === "assistant" && m.fin === "length" && !m.erreur && !m.arretee
+    && !!String(m.texte || "").trim() && !aDesOutils(m) && !enCours && !compactage;
+}
+function planSuite(c, m) {
+  const total = +sante.max_context || 0;
+  if (!(total > 0) || m.lus == null || !continuable(c, m)) return null;
+  const utilise = m.lus + (m.ecritsDernier ?? m.ecrits ?? 0);     // the continuation reads all of it, its thinking included
+  let gain = 0;
+  for (const x of vueModele(c.messages)) if (x.role === "assistant" && x.reflexion && (x === m || gardeReflexion === true)) gain += penseDe(x);
+  // a context really full (a response stopped by its length with room left is no context cut), and room really freed
+  if (utilise < total * 0.9 || gain < total * COMPACTION.GAIN_MINI) return null;
+  const apres = Math.max(0, utilise - gain);
+  if (total - apres < total * COMPACTION.REESSAI_MINI) return null;
+  return {genre: "reflexion", gain, avant: utilise, apres};
+}
+// compact what planSuite says, then continue the response in its bubble
+async function compacterEtPoursuivre(c, m, plan = planSuite(c, m)) {
+  if (!plan || (await compacter(c, null, plan)) !== "ok") return false;
+  demander(c, false, m);
+  return true;
+}
+// what a compaction of the messages before a cut response would do, when it frees enough room for asking again to be
+// worth it (a fifth of the context: the room the threshold keeps for a response); null otherwise
+function planReessai(c, avant, coupee) {
+  const plan = planCompaction(c, "manuel", 0, avant, (coupee && coupee.ecrits) || 0);
+  const total = +sante.max_context || 0, utilise = contexteUtilise(c, avant);
+  return plan && plan.apres != null && utilise != null && total > 0 && utilise - plan.apres >= total * COMPACTION.REESSAI_MINI ? plan : null;
+}
+// A response the context cut: compact what came before its message, then ask again. The cut response goes, as
+// with Regenerate; when the compaction does not happen, everything is back as it was.
+async function compacterEtReessayer() {
+  const c = convCourante();
+  if (!c || enCours || compactage) return;
+  const n = dernierVrai(c) + 1, coupee = c.messages[n - 1], question = c.messages[n - 2];
+  if (!coupee || coupee.role !== "assistant" || !question || question.role !== "user") return;
+  const plan = planReessai(c, c.messages.slice(0, n - 2), coupee);
+  if (!plan) return;
+  const retires = c.messages.splice(n - 2);          // its message, the response, and a continuation's node if any
+  const fait = await compacter(c, question, plan);
+  if (fait !== "ok") {
+    const k = c.messages.indexOf(question);
+    if (k >= 0) c.messages.splice(k, 1);
+    c.messages.push(...retires);
+    c.modifie = Date.now();
+    garderConvs(); dessinerFil();
+    return;
+  }
+  demander(c);
+}
+function elementCompaction(m, i) {
+  const el = document.createElement("div");
+  el.className = "msg msg--compaction";
+  el.dataset.i = i;
+  el.innerHTML = `<details class="compaction"><summary>${ic("compacter", "ic ic--p")}<span class="compaction__titre"></span>${ic("chevron", "ic ic--p chevron")}</summary>` +
+    `<div class="compaction__corps"><div class="reponse md"></div><div class="msg__meta"><span class="meta-texte"></span><span class="meta-actions">` +
+    `<button type="button" class="btn btn--icone" data-copier-msg title="Copy summary" aria-label="Copy summary">${ic("copier")}</button>` +
+    `<button type="button" class="btn btn--icone" data-retirer-compaction title="Remove this compaction" aria-label="Remove this compaction">${ic("corbeille")}</button>` +
+    `</span></div></div></details>`;
+  elementsCompaction.set(m, el);
+  majCompaction(m);
+  return el;
+}
+function majCompaction(m) {
+  const el = elementsCompaction.get(m);
+  if (!el) return;
+  const vivant = !!compactage && compactage.noeud === m;
+  const leger = estAllege(m);
+  const det = el.querySelector("details");
+  det.dataset.etat = vivant ? "cours" : "fini";
+  det.dataset.genre = leger ? "reflexion" : "resume";
+  let titre;
+  if (vivant) {
+    const live = (mesures && mesures.live) || {};
+    const lu = live.state === "reading" ? partLue(live) : null;
+    titre = ["Compacting conversation", compactage.phase === "ecriture" ? "writing the summary" : compactage.phase === "reflexion" ? "thinking"
+      : lu != null ? `reading ${nf(lu * 100)}%` : "reading"];
+    if (m.texte && !det._ouvert) { det._ouvert = true; det.open = true; }      // the summary shows while it is written
+  } else {
+    titre = [leger ? "Earlier thinking left out" : "Conversation compacted", m.avant != null && m.apres != null ? `${nf(m.avant)} → about ${nf(m.apres)} tokens`
+      : m.avant != null ? `from ${nf(m.avant)} tokens` : null];
+  }
+  const t = el.querySelector(".compaction__titre"), html = morceaux(titre);
+  if (t._html !== html) { t._html = html; t.innerHTML = html; }
+  const rep = el.querySelector(".reponse"), texte = leger ? "leger:" : m.texte;
+  if (rep._texte !== texte) {
+    rep._texte = texte;
+    rep.innerHTML = leger ? `<p>The thinking of the responses above is no longer sent to the model. Every message stays as written.</p>`
+      : m.texte ? enHtml(m.texte) : "";
+  }
+  const meta = leger ? [quand(m.temps)] : [m.ecrits != null ? `${nf(m.ecrits)} tokens` : null, m.duree != null ? `${nf(m.duree, 1)} s` : null,
+    m.gardes != null ? `${nf(m.gardes)} ${m.gardes === 1 ? "step" : "steps"} kept as written` : null, quand(m.temps)];
+  el.querySelector(".meta-texte").innerHTML = vivant ? "" : morceaux(meta);
+  el.querySelector(".meta-actions").hidden = vivant;
+  el.querySelector("[data-copier-msg]").hidden = leger;
+}
+function retirerCompaction(i) {
+  const c = convCourante();
+  if (!c || enCours || compactage || !estNoeud(c.messages[i])) return;
+  const [noeud] = c.messages.splice(i, 1);
+  c.modifie = Date.now();
+  garderConvs(); dessinerFil();
+  annonce("info", "Compaction removed", estAllege(noeud) ? "The model reads the earlier thinking again." : "The model reads the whole conversation again.", 7000, {libelle: "Undo", faire: () => {
+    c.messages.splice(Math.min(i, c.messages.length), 0, noeud);
+    c.modifie = Date.now();
+    garderConvs(); dessinerFil();
+  }});
+}
+// The context gauge: the chip beside the response settings, and its details in the drawer with the compaction button.
+function dessinerJauge() {
+  const c = convCourante();
+  const total = +sante.max_context || 0;
+  let utilise = contexteUtilise(c), environ = contexteEstime(c);
+  // while its response is read or written, what the context holds now, as the server says it: the message read
+  // and what is written so far (llama.cpp's gauge moves the same way). It only goes up during a response: the server
+  // first announces an estimate of the message to read (618 tokens, then 549 counted; 1,921, then 2,474), and it is
+  // idle again an instant before the page has the end of the stream (seen through the real window: the gauge fell back
+  // to the value from before the request at the end of each response).
+  const live = (mesures && mesures.live) || {};
+  const mien = !!enCours && enCours.c === c;
+  if (mien && enCours.phase !== "envoi" && live.prompt_tokens != null && (live.state === "reading" || live.state === "generating")) {
+    enCours.jauge = Math.max(enCours.jauge || 0, enCours.plancher || 0, live.prompt_tokens + (live.state === "generating" ? Math.max(live.generated || 0, 0) : 0));
+    // kept for a response that ends without the server's count; the message's size is exact once it is being written
+    if (live.state === "generating" || enCours.lusVivant == null) enCours.lusVivant = live.prompt_tokens;
+    if (live.state === "generating") enCours.ecritsVivant = Math.max(enCours.ecritsVivant || 0, live.generated || 0);
+  }
+  const enVol = mien && enCours.jauge != null;
+  if (enVol) { utilise = total > 0 ? Math.min(enCours.jauge, total) : enCours.jauge; environ = false; }
+  const connu = total > 0 && utilise != null;
+  const pct = connu ? Math.min(100, Math.round((utilise / total) * 100)) : 0;
+  // amber when the next message will compact first (automatic), or when the context is nearly full
+  const auto = !!reglages.compactionAuto;
+  const haut = connu && (pct >= (auto ? Math.min(+reglages.compactionSeuil || DEFAUTS.compactionSeuil, 100) : 90) || (auto && !enVol && !!planCompaction(c, "auto")));
+  const puce = $("btn-jauge");
+  puce.hidden = !connu;
+  puce.dataset.niveau = haut ? "haut" : "";
+  puce.title = connu ? `Context: ${environ ? "about " : ""}${nf(utilise)} of ${nf(total)} tokens` : "Context";
+  $("jauge-arc").style.strokeDasharray = `${pct} 100`;
+  $("jauge-texte").textContent = `${connu && environ ? "~" : ""}${pct}%`;
+  $("o-jauge").textContent = connu ? `${environ ? "about " : ""}${nf(utilise)} / ${nf(total)} tokens` : "";
+  $("jauge-barre-boite").dataset.niveau = haut ? "haut" : "";
+  $("jauge-barre").style.width = `${pct}%`;
+  $("jauge-note").innerHTML = connu ? morceaux([`${environ ? "about " : ""}${pct}% used`, `${nf(Math.max(0, total - utilise))} remaining`])
+    : esc(c && c.messages.length ? "Known after the next response." : "Known after the first response.");
+  // the button, and under it what it would do now: said, not left to a tooltip on a greyed button
+  const plan = planCompaction(c, "manuel");
+  const quoi = !plan ? "Nothing to compact yet." : plan.genre === "resume" ? "The model summarizes the conversation; the last steps stay as written."
+    : "Leaves out the thinking of earlier responses; every message stays as written.";
+  $("btn-compacter").disabled = !plan || !!enCours || !!compactage;
+  $("btn-compacter").title = quoi;
+  $("compacter-note").textContent = quoi;
+}
+// the last message's end notice follows what the server can do (a longer context) and what a compaction could
+function majDernierMessage() {
+  const c = convCourante();
+  if (!c || enCours || compactage) return;
+  const m = c.messages[dernierVrai(c)], el = m && elements.get(m);
+  if (el && m.role === "assistant") majLapilli(el, m, false);
+}
+// whether the Engine settings card can serve a longer context than now
+function contextePlusLong() {
+  const m = reglagesMoteur, ctx = (m && m.context) || {};
+  if (!m || !m.supported || ctx.source === "command line" || ctx.source === "slots") return false;
+  const servi = +sante.max_context || +ctx.value || 0;
+  return (ctx.choices || []).some((n) => n > servi);
+}
 const elements = new WeakMap();            // a Lapilli message -> its element in the thread
 function elementMessage(m, i) {
+  if (estNoeud(m)) return elementCompaction(m, i);
   const el = document.createElement("div");
   el.dataset.i = i;
   if (m.role === "user") {
@@ -810,6 +1413,8 @@ function majLapilli(el, m, vivant) {
   }
   const fin = el.querySelector(".fin");
   const notes = [];
+  // a notice's buttons as one group: they go to the next line together, on the right
+  const actions = (b) => (b ? `<span class="fin-note__actions">${b}</span>` : "");
   if (!vivant && outils) {                           // the page has no tools
     notes.push(`<div class="fin-note"><span class="fin-note__texte">${ic("info", "ic ic--p")}<span>${m.outils.length > 1 ? "The model wanted to use tools." : "The model wanted to use a tool."} This page has none: nothing was run.</span></span></div>`);
   }
@@ -817,12 +1422,33 @@ function majLapilli(el, m, vivant) {
     // the length the response asked for, or the end of the context: with no length, or fewer tokens than the
     // length asked (the server cut it to the room the conversation left), it is the context that stopped it, and the
     // settings cannot give it more room
-    const contexte = !m.limite || (m.ecrits != null && m.ecrits < m.limite);
+    const contexte = coupeeParContexte(m);
     const ctx = +sante.max_context || 0;
-    notes.push(contexte
-      ? `<div class="fin-note"><span class="fin-note__texte">${ic("alerte", "ic ic--p")}<span>The response filled the model's context${ctx ? ` (${nf(ctx)}\u00a0tokens)` : ""}.</span></span></div>`
-      : `<div class="fin-note"><span class="fin-note__texte">${ic("alerte", "ic ic--p")}<span>The response reached the maximum length (${nf(m.limite)}\u00a0tokens).</span></span>` +
-        `<button type="button" class="btn btn--doux" data-ouvrir-reglages>Settings</button></div>`);
+    if (contexte) {
+      // with what to do about it. Something came before its message: compact that, then ask again. Nothing
+      // did: when its thinking took most of it (said with its count: the server stops a thinking at three quarters of
+      // the room, whatever the context), a shorter thinking; and a longer context when the server can serve one.
+      const conv = convCourante(), k = conv ? conv.messages.indexOf(m) : -1;
+      const enDernier = !!conv && k >= 1 && k === dernierVrai(conv) && !enCours && !compactage;
+      const avant = enDernier && conv.messages[k - 1].role === "user" ? conv.messages.slice(0, k - 1) : null;
+      // with text written, it goes on; without, its message is asked again
+      const suite = enDernier ? planSuite(conv, m) : null;
+      const plan = !suite && avant ? planReessai(conv, avant, m) : null;
+      const plusLong = enDernier && !plan && contextePlusLong(), pensif = enDernier && !plan && penseDe(m) * 2 > (m.ecrits || 0);
+      const lien = `<a href="#apropos" data-vers-moteur>About</a>`;
+      const pense = pensif ? (m.pense != null ? `, ${nf(m.pense)} of them for its thinking` : ", most of them for its thinking") : "";
+      const conseil = pensif ? ` Choose a shorter thinking${plusLong ? `, or make the context longer under ${lien}` : ""}.` : plusLong ? ` Make it longer under ${lien}.` : "";
+      notes.push(`<div class="fin-note"><span class="fin-note__texte">${ic("alerte", "ic ic--p")}<span>The response filled the model's context${ctx ? ` (${nf(ctx)}\u00a0tokens)` : ""}${pense}.${conseil}</span></span>` +
+        actions((suite ? `<button type="button" class="btn btn--doux" data-compacter-poursuivre>Compact and continue</button>`
+          : plan ? `<button type="button" class="btn btn--doux" data-compacter-reessayer>Compact and try again</button>` : "") +
+          (pensif ? `<button type="button" class="btn btn--doux" data-ouvrir-reglages>Settings</button>` : "")) + `</div>`);
+    } else {
+      const conv2 = convCourante(), place = (+sante.max_context || 0) - (m.lus || 0) - (m.ecritsDernier ?? m.ecrits ?? 0);
+      const encore = conv2 && continuable(conv2, m) && place > Math.min(1024, (+sante.max_context || 0) / 8);
+      notes.push(`<div class="fin-note"><span class="fin-note__texte">${ic("alerte", "ic ic--p")}<span>The response reached the maximum length (${nf(m.limite)}\u00a0tokens).</span></span>` +
+        actions((encore ? `<button type="button" class="btn btn--doux" data-poursuivre>Continue</button>` : "") +
+          `<button type="button" class="btn btn--doux" data-ouvrir-reglages>Settings</button>`) + `</div>`);
+    }
   }
   const notesHtml = notes.join("");
   if (fin._notes !== notesHtml) { fin._notes = notesHtml; fin.innerHTML = notesHtml; }
@@ -832,7 +1458,7 @@ function majLapilli(el, m, vivant) {
   if (m.metaTitre) el.querySelector(".msg__meta .meta-texte").title = m.metaTitre;
   el.querySelector("[data-copier-msg]").hidden = vivant || !m.texte;
   const c = convCourante();
-  const dernier = c && c.messages[c.messages.length - 1] === m;
+  const dernier = c && c.messages[dernierVrai(c)] === m;
   el.querySelector("[data-regenerer]").hidden = vivant || !dernier || !!enCours;
 }
 function dessinerFil() {
@@ -843,6 +1469,7 @@ function dessinerFil() {
   $("accueil").hidden = !vide;
   if (c) c.messages.forEach((m, i) => fil.appendChild(elementMessage(m, i)));
   descendre(true);
+  dessinerJauge();
 }
 const filDefile = $("fil-defile");
 const presDuBas = () => filDefile.scrollHeight - filDefile.scrollTop - filDefile.clientHeight < 140;
@@ -865,6 +1492,25 @@ $("fil").addEventListener("click", (e) => {
     return;
   }
   if (e.target.closest("[data-regenerer]")) { regenerer(); return; }
+  const rc = e.target.closest("[data-retirer-compaction]");
+  if (rc) { retirerCompaction(+rc.closest(".msg").dataset.i); return; }
+  if (e.target.closest("[data-compacter-reessayer]")) { compacterEtReessayer(); return; }
+  if (e.target.closest("[data-compacter-poursuivre]")) {   // compact, then the response goes on
+    const c = convCourante(), m = c && c.messages[dernierVrai(c)];
+    if (m) compacterEtPoursuivre(c, m);
+    return;
+  }
+  if (e.target.closest("[data-poursuivre]")) {             // llama.cpp's Continue: the response goes on
+    const c = convCourante(), m = c && c.messages[dernierVrai(c)];
+    if (m && continuable(c, m)) demander(c, false, m);
+    return;
+  }
+  if (e.target.closest("[data-vers-moteur]")) {    // the Engine settings card, on About
+    e.preventDefault();
+    montrerVue("apropos");
+    $("carte-reglages-moteur").scrollIntoView({block: "start"});
+    return;
+  }
   if (e.target.closest("[data-repondre-maintenant]")) { repondreMaintenant(); return; }
   if (e.target.closest("[data-ouvrir-reglages]")) { ouvrirTiroir(true); return; }
   const s = e.target.closest(".suggestion");
@@ -1009,7 +1655,9 @@ $("fil").addEventListener("toggle", (e) => {
 }, true);
 
 // ------------------------------------------------------------------ response settings
-const DEFAUTS = {reflexion: "medium", longueur: 8192, montrer: true, temperature: null, top_p: null, top_k: null, graine: ""};
+const DEFAUTS = {reflexion: "medium", longueur: 8192, montrer: true, temperature: null, top_p: null, top_k: null, graine: "",
+                 // the compaction: automatic at 80% as in our llama.cpp interface, llama.cpp's 10 kept steps, its prompt when empty
+                 compactionAuto: true, suiteAuto: true, compactionSeuil: 80, compactionPlace: "reponse", compactionEtapes: 10, compactionConsigne: ""};
 let reglages = {...DEFAUTS, ...memoire.lire("reglages", {})};
 const NOMS_REFLEXION = {none: "No thinking", low: "Short thinking", medium: "Medium thinking", high: "Long thinking"};
 const AIDE_REFLEXION = {none: "answers right away", low: "thinks a little", medium: "thinks, then answers", high: "thinks it through"};
@@ -1038,6 +1686,7 @@ function ligneContexte() {
   const lien = !!(reglagesMoteur && reglagesMoteur.supported);
   if (lignePour === `${ctx}:${lien}`) return;
   lignePour = `${ctx}:${lien}`;
+  majDernierMessage();
   const c = $("r-contexte");
   c.hidden = !(ctx > 0);
   c.replaceChildren();
@@ -1073,12 +1722,23 @@ function chargerTiroir() {
   $("o-topk").textContent = `${nf(+k)}${reglages.top_k == null ? " (default)" : ""}`;
   $("r-topp").disabled = $("r-topk").disabled = +t === 0;
   $("r-graine").value = reglages.graine || "";
+  $("r-compaction-auto").setAttribute("aria-checked", String(!!reglages.compactionAuto));
+  $("r-compaction-seuil").value = reglages.compactionSeuil;
+  $("r-compaction-seuil").disabled = !reglages.compactionAuto;
+  $("r-suite-auto").setAttribute("aria-checked", String(!!reglages.suiteAuto));
+  $("r-suite-auto").disabled = !reglages.compactionAuto;
+  $("r-compaction-place").value = reglages.compactionPlace === "texte" ? "texte" : "reponse";
+  $("r-compaction-place").disabled = !reglages.compactionAuto;
+  $("r-compaction-etapes").value = reglages.compactionEtapes;
+  if (document.activeElement !== $("r-compaction-consigne")) $("r-compaction-consigne").value = reglages.compactionConsigne || COMPACTION.CONSIGNE;
+  dessinerJauge();
   $("r-defauts").textContent = `Model defaults: temperature ${nf(defautsModele.temperature, 2)}, top-p ${nf(defautsModele.top_p, 2)}, top-k ${nf(defautsModele.top_k)}.`;
   resumeReglages();
 }
 function garderReglages(note = "Saved in this browser.") {
   memoire.ecrire("reglages", reglages);
   chargerTiroir();
+  majDernierMessage();                              // what its end notice offers follows the compaction settings
   $("r-note").textContent = note;
 }
 for (const b of $("r-reflexion").children) b.onclick = () => { reglages.reflexion = b.dataset.v; garderReglages(); };
@@ -1089,6 +1749,19 @@ $("r-topp").oninput = () => { reglages.top_p = +$("r-topp").value; garderReglage
 $("r-topk").oninput = () => { reglages.top_k = +$("r-topk").value; garderReglages(); };
 $("r-graine").onchange = () => { reglages.graine = $("r-graine").value.trim(); garderReglages(); };
 $("r-retablir").onclick = () => { reglages = {...DEFAUTS}; garderReglages("Default settings restored."); };
+const entierEntre = (el, min, max, defaut) => { const n = Math.round(+el.value); return el.value.trim() !== "" && Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : defaut; };
+$("r-compaction-auto").onclick = () => { reglages.compactionAuto = !reglages.compactionAuto; garderReglages(); };
+$("r-suite-auto").onclick = () => { reglages.suiteAuto = !reglages.suiteAuto; garderReglages(); };
+$("r-compaction-seuil").onchange = () => { reglages.compactionSeuil = entierEntre($("r-compaction-seuil"), 1, 100, DEFAUTS.compactionSeuil); garderReglages(); };
+$("r-compaction-place").onchange = () => { reglages.compactionPlace = $("r-compaction-place").value === "texte" ? "texte" : "reponse"; garderReglages(); };
+$("r-compaction-etapes").onchange = () => { reglages.compactionEtapes = entierEntre($("r-compaction-etapes"), 0, 100, DEFAUTS.compactionEtapes); garderReglages(); };
+$("r-compaction-consigne").onchange = () => {
+  const t = $("r-compaction-consigne").value.trim();
+  reglages.compactionConsigne = t === COMPACTION.CONSIGNE ? "" : t;   // the default one is not kept as a choice
+  garderReglages();
+};
+$("btn-compacter").onclick = () => { ouvrirTiroir(false); compacter(convCourante()); };
+$("btn-jauge").onclick = () => { ouvrirTiroir(true); $("bloc-jauge").scrollIntoView({block: "nearest"}); };
 function ouvrirTiroir(ouvert) {
   $("tiroir").dataset.ouvert = String(ouvert);
   $("tiroir").setAttribute("aria-hidden", String(!ouvert));
@@ -1240,12 +1913,13 @@ $("saisie").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); envoyer(); }
 });
 $("saisie-form").onsubmit = (e) => { e.preventDefault(); envoyer(); };
-$("btn-arreter").onclick = () => { if (enCours) enCours.controleur.abort(); };
+$("btn-arreter").onclick = () => { if (compactage) compactage.controleur.abort(); else if (enCours) enCours.controleur.abort(); };
 
-function messagesApi(c, sauf) {
+function messagesApi(c, sauf) { return messagesDe(vueModele(c.messages.filter((m) => m !== sauf))); }
+function messagesDe(liste, sansReflexion = false) {
   const out = [];
-  for (const m of c.messages) {
-    if (m === sauf) continue;
+  for (const m of liste) {
+    if (estNoeud(m)) { out.push({role: "user", content: COMPACTION.GABARIT + m.texte}); continue; }   // the summary, framed
     if (m.role === "user") {
       const texteMsg = [m.texte, ...(m.fichiers || []).map(blocFichier)].filter((s) => s).join("\n\n");
       // its images as bytes, after its text; an image this browser no longer keeps (storage full) is mentioned
@@ -1260,7 +1934,7 @@ function messagesApi(c, sauf) {
       // recognizes its own memory (a follow-up reuses about 95% of its message and starts in 0.2 s, instead of
       // reading the whole previous answer again)
       const msg = {role: "assistant", content: m.texte || ""};
-      if (m.reflexion) msg.reasoning_content = m.reflexion;
+      if (m.reflexion && !sansReflexion) msg.reasoning_content = m.reflexion;
       // its tool calls go back too (the server recognizes its own memory); a cut-off call (incomplete JSON) would be
       // refused by the server: it stays on screen only
       const appels = aDesOutils(m) ? m.outils.filter((o) => o.nom && argsValides(o.args)) : [];
@@ -1271,28 +1945,61 @@ function messagesApi(c, sauf) {
   }
   return out;
 }
-function envoyer() {
+async function envoyer() {
   const texte = $("saisie").value.trim();
-  if ((!texte && !pieces.length) || enCours) return;
+  if ((!texte && !pieces.length) || enCours || compactage) return;
   let c = convCourante();
   if (!c) {
     c = {id: nouvelId(), titre: titreDe(texte, pieces), cree: Date.now(), modifie: Date.now(), messages: []};
     convs.unshift(c);
     courante = c.id;
   }
-  c.messages.push({role: "user", texte, fichiers: pieces.filter((p) => !p.image).map((p) => ({nom: p.nom, texte: p.texte})),
+  const message = {role: "user", texte, fichiers: pieces.filter((p) => !p.image).map((p) => ({nom: p.nom, texte: p.texte})),
                    images: pieces.filter((p) => p.image).map((p) => ({nom: p.nom, image: p.image, l: p.l, h: p.h})),
-                   temps: Date.now()});
+                   temps: Date.now()};
+  // (our llama.cpp interface) near the end of the context, compact first: the message waits, then goes on the reduced context
+  const car = texte.length + pieces.reduce((n, p) => n + (p.image ? 0 : String(p.texte || "").length), 0);
+  const plan = reglages.compactionAuto ? planCompaction(c, "auto", Math.ceil(car / COMPACTION.CAR_PAR_JETON)) : null;
+  const piecesAvant = pieces;
   pieces = []; dessinerPieces();
   $("saisie").value = ""; ajusterSaisie();
+  if (plan) {
+    const fait = await compacter(c, message, plan);
+    if (fait === "arrete") {                       // stopped by hand: the message goes back to the input, unsent
+      const k = c.messages.indexOf(message);
+      if (k >= 0) c.messages.splice(k, 1);
+      $("saisie").value = texte; pieces = piecesAvant; dessinerPieces(); ajusterSaisie();
+      garderConvs(); dessinerFil();
+      return;
+    }
+    if (fait === "rien") c.messages.push(message);   // no compaction ran: sent as usual
+  } else c.messages.push(message);                   // (a failed compaction leaves the message in place: it is sent all the same)
   demander(c);
 }
-function regenerer() {
+async function regenerer() {
   const c = convCourante();
-  if (!c || enCours) return;
-  const dernier = c.messages[c.messages.length - 1];
+  if (!c || enCours || compactage) return;
+  const idx = dernierVrai(c), dernier = c.messages[idx];
   if (!dernier || dernier.role !== "assistant") return;
-  c.messages.pop();
+  const retires = c.messages.splice(idx);           // the response, and the node of its continuation if any
+  // asked again as a message is sent: near the end of the context, compact first what came before its message
+  // (a response the context cut says what room it needs at least)
+  const question = c.messages[c.messages.length - 1];
+  if (reglages.compactionAuto && question && question.role === "user") {
+    const car = String(question.texte || "").length + (question.fichiers || []).reduce((n, f) => n + String(f.texte || "").length, 0);
+    const plan = planCompaction(c, "auto", Math.ceil(car / COMPACTION.CAR_PAR_JETON), c.messages.slice(0, -1), dernier.fin === "length" ? placeDe(dernier) || 0 : 0);
+    if (plan) {
+      c.messages.pop();
+      const fait = await compacter(c, question, plan);
+      if (!c.messages.includes(question)) c.messages.push(question);
+      if (fait === "arrete") {                       // stopped by hand: the response is back as it was
+        c.messages.push(...retires);
+        c.modifie = Date.now();
+        garderConvs(); dessinerFil();
+        return;
+      }
+    }
+  }
   demander(c);
 }
 
@@ -1332,7 +2039,7 @@ function activite() {
     } else {
       phase = "lecture";
       const lu = live.state === "reading" ? partLue(live) : null;
-      txt = ["Reading your message", live.state === "reading" && live.prompt_tokens ? `${nf(live.prompt_tokens)} tokens` : null,
+      txt = [enCours.suite ? "Reading the conversation" : "Reading your message", live.state === "reading" && live.prompt_tokens ? `${nf(live.prompt_tokens)} tokens` : null,
              lu != null ? `${nf(lu * 100)}%` : null, dur >= 1 ? `${nf(dur, 0)} s` : null];
       barreLue = live.state === "reading" ? lu || 0 : null;
     }
@@ -1370,15 +2077,23 @@ async function repondreMaintenant() {
   }
 }
 
-async function demander(c) {
-  const m = {role: "assistant", texte: "", reflexion: "", temps: Date.now()};
-  c.messages.push(m);
+async function demander(c, rattrapage = false, suite = null) {
+  // `suite`: a response that goes on, in its bubble (the server continues the final assistant message)
+  const m = suite || {role: "assistant", texte: "", reflexion: "", temps: Date.now()};
+  const avant = suite ? {ecrits: m.ecrits || 0, pense: m.pense || 0, refl: m.reflexionS || 0, duree: m.dureeS || 0} : null;
+  const sauve = suite ? {...suite} : null;          // the response as it was: a continuation that writes nothing leaves it so
+  if (suite) {
+    m.suites = (m.suites || 0) + 1;
+    for (const k of ["erreur", "arretee", "fin", "pleinMoteur", "compteEstime"]) delete m[k];
+    m.reflexionS = null;
+  } else c.messages.push(m);
   c.modifie = Date.now();
   garderConvs(); dessinerConvs(); dessinerFil();
   const el = elements.get(m);
   const controleur = new AbortController();
-  enCours = {controleur, c, m, el, idClient: `lapilli-${nouvelId()}`, debut: performance.now(), premier: null, debutRefl: null, finRefl: null,
-             morceaux: 0, phase: "envoi", maintenantDemande: false};
+  enCours = {controleur, c, m, el, suite: !!suite, idClient: `lapilli-${nouvelId()}`, debut: performance.now(), premier: null, debutRefl: null, finRefl: null,
+             morceaux: 0, pensees: 0, phase: "envoi", maintenantDemande: false, jauge: null, plancher: 0};
+  enCours.plancher = contexteUtilise(c) || 0;       // what the conversation held before this request: the gauge starts from it
   suivre = true;
   occupe(true);
   majLapilli(el, m, true);
@@ -1387,8 +2102,9 @@ async function demander(c) {
   const garde = setInterval(() => { c.modifie = Date.now(); garderConvs(); }, 5000);
   relever();
 
-  const corps = {model: (mesures && mesures.engine && mesures.engine.model) || sante.model || "flash-next", messages: messagesApi(c, m), stream: true,
-                 reasoning_effort: reglages.reflexion};
+  const corps = {model: (mesures && mesures.engine && mesures.engine.model) || sante.model || "flash-next",
+                 messages: suite ? messagesDe(vueModele(c.messages)) : messagesApi(c, m), stream: true, reasoning_effort: reglages.reflexion};
+  if (suite) corps.continue_final_message = true;  // llama.cpp's request field: this response goes on
   if (reglages.longueur > 0) {   // a cap the server fits to the room the conversation leaves (fit_max_tokens), never a refusal
     corps.max_tokens = reglages.longueur;
     corps.fit_max_tokens = true;
@@ -1399,9 +2115,9 @@ async function demander(c) {
     if (reglages.top_k != null) corps.top_k = reglages.top_k;
   }
   if (reglages.graine !== "" && Number.isFinite(+reglages.graine)) corps.seed = +reglages.graine;
-  m.limite = corps.max_tokens || null;
+  m.limite = corps.max_tokens ? (avant ? avant.ecrits : 0) + corps.max_tokens : null;
 
-  let usage = null, timings = null, fin = null;
+  let usage = null, timings = null, fin = null, refuse = null;
   try {
     const r = await fetch("v1/chat/completions", {method: "POST", headers: {...entetes(true), "x-client-request-id": enCours.idClient},
                                                     body: JSON.stringify(corps), signal: controleur.signal});
@@ -1428,6 +2144,7 @@ async function demander(c) {
         if (!enCours.debutRefl) enCours.debutRefl = t;
         m.reflexion += d.reasoning_content;
         enCours.morceaux++;
+        enCours.pensees++;                          // one piece is one token, or nearly (measured: 5,726 for 5,728)
         enCours.phase = "reflexion";
       }
       if (d.content) {
@@ -1469,22 +2186,52 @@ async function demander(c) {
     if (tampon.trim()) traiter(tampon.trim());                  // a last line without a line ending
   } catch (e) {
     if (e.name === "AbortError") m.arretee = true;
-    else { m.erreur = String(e.message || e); annonce("erreur", "The response failed", m.erreur, 9000); }
+    // the engine's own words for a context that is full: the 27B's next draft block no longer fits and it fails
+    // the request instead of ending it (src/dense/session.cpp). For the page it is a response the context cut.
+    else if (/no room for a draft block/i.test(String(e.message || ""))) { fin = "length"; m.pleinMoteur = true; }
+    else {
+      m.erreur = String(e.message || e);
+      // refused for lack of room with messages before this one: it is the conversation that no longer fits. What the
+      // server says it weighs (its own count) is kept: a compaction can still make room and send the message again.
+      if (e.statut === 400 && /context/i.test(`${e.code} ${e.detail}`) && vueModele(c.messages).filter((x) => !estNoeud(x) && x !== m).length > 1) {
+        m.erreur = COMPACTION.CONVERSATION;
+        refuse = {lu: +((/prompt \((\d+) tokens\)/.exec(String(e.detail || "")) || [])[1]) || null};
+      }
+    }
   }
   clearInterval(minuterie);
   clearInterval(garde);
   clearTimeout(peintureDemandee); peintureDemandee = 0;
   const maintenant = performance.now();
   if (enCours.debutRefl && m.reflexionS == null) m.reflexionS = ((enCours.finRefl || maintenant) - enCours.debutRefl) / 1000;
+  if (avant) m.reflexionS = avant.refl + (m.reflexionS || 0) || null;
   m.fin = fin;
-  const duree = (maintenant - enCours.debut) / 1000;
-  const n = usage ? usage.completion_tokens : null;
+  const duree = (maintenant - enCours.debut) / 1000 + (avant ? avant.duree : 0);
+  m.dureeS = duree;
+  const nDernier = usage ? usage.completion_tokens : null;
+  const n = nDernier == null ? null : nDernier + (avant ? avant.ecrits : 0);
   m.ecrits = n;   // the end notice tells a length reached from a context filled
+  m.ecritsDernier = nDernier;                       // with lus: what the context holds after this request
+  m.mesureA = Date.now();                           // newer than a compaction node placed before it continued
+  m.lus = usage && usage.prompt_tokens != null ? usage.prompt_tokens : null;   // with ecrits: the context this conversation holds
+  // without the server's final count (stopped by hand, an engine error) the response still sits in the
+  // conversation: what the server said while it was written (the message read, the tokens written at its last reading)
+  // and the pieces received stand for it, marked as an estimate. Without them the gauge showed the context from before.
+  if (!usage && enCours.lusVivant != null) {
+    m.lus = enCours.lusVivant;
+    m.ecritsDernier = Math.max(enCours.ecritsVivant || 0, enCours.morceaux);
+    m.ecrits = m.ecritsDernier + (avant ? avant.ecrits : 0);
+    m.compteEstime = true;
+  }
+  // its thinking in tokens, known at once from the pieces received (a message sent right away already counts on
+  // it); the server's own count of the text replaces it a moment later (compterPensees)
+  if (m.reflexion) { m.pense = enCours.pensees + (avant ? avant.pense : 0); m.penseDernier = enCours.pensees; m.penseDesMorceaux = true; }
   const meta = [];
   if (m.arretee) meta.push("Stopped");
   if (m.erreur) meta.push("Error");
   if (n != null) meta.push(`${nf(n)} tokens`);
-  else if (enCours.morceaux) meta.push(`about ${nf(enCours.morceaux)} tokens`);
+  else if (enCours.morceaux) meta.push(`about ${nf(enCours.morceaux + (avant ? avant.ecrits : 0))} tokens`);
+  if (m.suites) meta.push(m.suites === 1 ? "continued" : `continued ${m.suites} times`);
   const vit = timings && timings.predicted_per_second ? timings.predicted_per_second
     : n && enCours.premier && maintenant - enCours.premier > 250 ? n / ((maintenant - enCours.premier) / 1000) : null;
   if (vit) meta.push(`${nf(vit, 1)} tokens/s`);
@@ -1501,13 +2248,38 @@ async function demander(c) {
   enCours = null;
   occupe(false);
   c.modifie = Date.now();
+  // a continuation that wrote nothing (refused, the link cut, stopped at once): the response stays as it was, its
+  // measures and its line included; an error is told in a notice. Never its message asked again: its text would go.
+  if (sauve && !usage && !fini.morceaux && String(m.texte || "") === String(sauve.texte || "")) {
+    const erreur = m.erreur;
+    for (const k of Object.keys(m)) if (!(k in sauve)) delete m[k];
+    Object.assign(m, sauve);
+    garderConvs(); dessinerConvs();
+    for (const x of c.messages) { const e2 = elements.get(x); if (e2) majLapilli(e2, x, false); }
+    dessinerJauge();
+    compterPensees(c);                              // the server's count of its thinking, which the snapshot may predate
+    if (erreur) annonce("erreur", "The response could not go on", erreur, 9000);
+    relever();
+    montrerAvisPage();
+    return;
+  }
+  // refused for lack of room: once, compact what the server's own count says must go, and send the message again
+  if (refuse && !rattrapage && !suite && reglages.compactionAuto && await rattraper(c, m, refuse.lu)) return;
+  if (m.erreur) annonce("erreur", "The response failed", m.erreur, 9000);
   garderConvs(); dessinerConvs();
   majLapilli(fini.el, m, false);
   // the "Regenerate" button lives on the last message only: redraw the meta lines of the others
   for (const x of c.messages) { const e2 = elements.get(x); if (e2 && x !== m) majLapilli(e2, x, false); }
   descendre();
+  dessinerJauge();
+  compterPensees(c);                                // its thinking, as the server counts it: what a compaction would free
   relever();
   if (m.arretee) { setTimeout(relever, 250); setTimeout(relever, 800); }   // the server sees the closed connection at the next token
+  // cut by the context with text written: compact its thinking (and the earlier one) and go on in its bubble,
+  // a few times at most, when the automatic compaction is on
+  if (reglages.compactionAuto && reglages.suiteAuto && coupeeParContexte(m) && (m.suites || 0) < COMPACTION.SUITES_MAX
+      && (await compacterEtPoursuivre(c, m))) return;
+  montrerAvisPage();                                // a newer page seen while it was written
 }
 
 // ------------------------------------------------------------------ save the conversation (Markdown)
@@ -1516,6 +2288,11 @@ function exporter() {
   if (!c || !c.messages.length) { annonce("info", "Nothing to save", "The conversation is empty.", 3000); return; }
   const md = [`# ${c.titre}`, "", `_${quand(c.cree)}, with Lapilli (${(mesures && mesures.engine && mesures.engine.model) || sante.model})_`, ""];
   for (const m of c.messages) {
+    if (estNoeud(m)) {
+      if (estAllege(m)) md.push("_The thinking of the responses above was left out of the context from here on._", "");
+      else if (m.texte) md.push("## Conversation compacted", "", "_Summary of the earlier exchange, written by the model:_", "", m.texte, "");
+      continue;
+    }
     if (m.role === "user") {
       md.push("## You", "", m.texte || "");
       for (const f of m.fichiers || []) md.push("", `_Attached file: ${f.nom}_`);
@@ -1549,6 +2326,8 @@ function exporter() {
   lireProps();
   relever();
   lireReglagesMoteur();
+  compterPensees(convCourante());
+  verifierPage();                                   // the reference: the page this tab was given
   window.addEventListener("resize", () => { ajusterSaisie(); majVersBas(); });
   // marked arrives with "defer" just before this script; if it is missing, the text stays readable as is
   if (!window.marked) annonce("alerte", "Formatting unavailable", "Text is shown raw (marked could not be loaded).", 8000);

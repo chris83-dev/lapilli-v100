@@ -225,7 +225,10 @@ public:
             // block the whole window) and the policy picks the window from their chances
             n = wide_ ? max_window() - 1 : std::clamp(n, 1, max_window() - 1);
             const int width = block_width(n);
-            if (pos + width > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
+            // the last positions of the context hold no whole block: this window decodes without drafts (the loop reads
+            // NotImplemented as "no drafts"), and the response ends where the context does, with "length". It used to
+            // fail the request ("no room for a draft block"): a response cut at the end of the context came out as an error.
+            if (pos + width > m_.o.max_context) return {Status::NotImplemented, m_.o.arch + ": no room for a draft block"};
             if (!block_draft(m_, st_, anchor, pos, width, err)) return fail(err);
             n_draft_ = std::min(width - 1, max_window() - 1);
             return {};
@@ -275,7 +278,12 @@ public:
         for (int i = 0; i < count; ++i) {
             nn[(size_t) i] = std::clamp(n[i], 1, share);
             width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
-            if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
+            // a slot near the end of its context: this round goes without drafts for the group, as above; the commits
+            // started by settle() above are joined first, as after a pass (a later settle() would not join them)
+            if (pos[i] + width[(size_t) i] > m_.o.max_context) {
+                for (int j = 0; j < count; ++j) ss[(size_t) j]->join_commit();
+                return {Status::NotImplemented, m_.o.arch + ": no room for a draft block"};
+            }
         }
         const cudaStream_t s0 = sts[0]->stream;
         for (int i = 0; i < count;) {

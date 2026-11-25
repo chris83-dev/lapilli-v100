@@ -75,7 +75,7 @@ class KeptFile(unittest.TestCase):
         self.assertEqual(page.context_choices(65536), [4096, 8192, 16384, 32768, 65536])
         self.assertEqual(page.context_choices(40960)[-2:], [32768, 40960])   # the model's own length, not a power of two
         self.assertEqual(page.context_choices(1048576)[-1], 1048576)
-        self.assertEqual(page.default_context(1048576), 32768)
+        self.assertEqual(page.default_context(1048576), 65536)
         self.assertEqual(page.default_context(16384), 16384)
         self.assertEqual(page.check_context(65536, 65536), 65536)
         for bad in (2048, 131072, "8192", True, 8192.0):

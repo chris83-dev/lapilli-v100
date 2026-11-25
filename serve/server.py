@@ -341,6 +341,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     svc = Service(engine, tok, dialect.template(template),
                   model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
+                  prefill_assistant=getattr(a, "prefill_assistant", True),
                   grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect, video_max_tokens=a.video_max_tokens)
     svc.logs = logs
     svc.page_settings = cfg.get("page_settings")      # (Lapilli) what the page's Engine settings show and change

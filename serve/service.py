@@ -99,8 +99,11 @@ class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "basalt",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
-                 dialect: Dialect | None = None, video_max_tokens: int = VIDEO_MAX_TOKENS):
+                 dialect: Dialect | None = None, video_max_tokens: int = VIDEO_MAX_TOKENS, prefill_assistant: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        # llama.cpp's --prefill-assistant, on by default: a conversation that ends with an assistant message
+        # continues it instead of answering after it (--no-prefill-assistant: as before)
+        self.prefill_assistant = prefill_assistant
         self.dialect = dialect or dialect_for(None)      # how this model's prompts and replies are written
         self.literals = self.dialect.literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
@@ -1206,13 +1209,44 @@ class Service:
                 "ram": {"used_gib": scaled(ram.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(ram.get("ram_total"), 2 ** 30, 1)} if ram.get("ram_total") else None}}
 
-    def render_prompt(self, messages, tools, kwargs) -> str:
+    def continuation(self, messages, force=None, cont=None) -> str | None:
+        """What a request continues, after llama.cpp's prefill-assistant (on by default, tools/server
+        server-common.cpp): a conversation that ends with an assistant message continues that message, its text
+        ("content") or, when it has written none yet, its thinking ("reasoning"); an empty one is left out ("empty").
+        `cont`: the request's continue_final_message (None: as the server is set, --prefill-assistant). None: nothing
+        to continue, the model answers after the conversation as before. ValueError (a 400) where llama.cpp refuses."""
+        last = messages[-1] if messages else {}
+        if last.get("role") != "assistant":
+            if cont is True:
+                raise ValueError("continue_final_message: the conversation does not end with an assistant message")
+            return None
+        if cont is False or (cont is None and not self.prefill_assistant):
+            return None
+        if len(messages) >= 2 and messages[-2].get("role") == "assistant":
+            raise ValueError("Cannot have 2 or more assistant messages at the end of the list.")
+        if last.get("tool_calls"):
+            raise ValueError("Cannot continue an assistant message that contains tool calls.")
+        if force:
+            raise ValueError("a forced tool call cannot continue an assistant message")
+        if _message_text(last.get("content")).strip():
+            return "content"
+        if str(last.get("reasoning_content") or "").strip():
+            return "reasoning"
+        return "empty"
+
+    def render_prompt(self, messages, tools, kwargs, continued=None) -> str:
         """Render the template. With `effort_end`, a non-default effort is rendered as the default up to the answer
-        (same prefix, cache kept) and follows as a short system turn right before it."""
+        (same prefix, cache kept) and follows as a short system turn right before it. `continued` (continuation()):
+        the conversation rendered whole, its final assistant message left open right after its text or its thinking."""
         kwargs = self.minimal_off(kwargs)
         if kwargs.get("reasoning_effort") not in (None, ""):
             kwargs = dict(kwargs, reasoning_effort=self.dialect.effort_level(kwargs["reasoning_effort"]))
         kwargs = self.dialect.template_kwargs(kwargs)
+        if continued:
+            full = self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
+            last = messages[-1]
+            return _cut_after(full, _message_text(last.get("content")) if continued == "content"
+                              else str(last.get("reasoning_content") or ""))
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or not self.dialect.effort_turn or (not off and effort in (None, "", "xhigh", "high")):
@@ -1226,11 +1260,11 @@ class Service:
         tail = "" if off else self.dialect.effort_turn.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
-    def render_text(self, messages, tools, kwargs) -> tuple[str, list]:
+    def render_text(self, messages, tools, kwargs, continued=None) -> tuple[str, list]:
         """The rendered prompt and the character spans in it where special-token text stays plain text: think tags
         and control-token text inside messages are text; only the template's own are special."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
-        prompt = self.render_prompt(marked, marked_tools, kwargs)
+        prompt = self.render_prompt(marked, marked_tools, kwargs, continued)
         if not changed:
             return prompt, []
         return unmark_think_literals(prompt, self.literals)
@@ -1249,12 +1283,12 @@ class Service:
             return kwargs
         return {**kwargs, **effort_kwargs(self.reasoning_effort)}
 
-    def encode_prompt(self, messages, tools, kwargs, videos=None) -> list[int]:
+    def encode_prompt(self, messages, tools, kwargs, videos=None, continued=None) -> list[int]:
         """The rendered, tokenized prompt (see render_text). `videos`: the text standing for each video in prompt order,
         put in place of the template's marker before the prompt is tokenized, so its timestamps are tokenized with the
         text around them as the reference processor's are."""
         kwargs = self.thinking_kwargs(kwargs)
-        prompt, plain = self.render_text(messages, tools, kwargs)
+        prompt, plain = self.render_text(messages, tools, kwargs, continued)
         if videos is not None:
             prompt, plain = self._splice_videos(prompt, plain, videos)
         if not plain:
@@ -1314,27 +1348,33 @@ class Service:
         if not state.startswith("on"):
             _refuse_images("this server cannot read video: " + state[4:].strip())
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, image_access=None, fit=False):
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, image_access=None, fit=False, cont=None):
         """Return (ids, thinking, max_new); an unset or non-positive max_new means the rest of the context.
         `force` (frontend.forced_call): the opening of the call the reply must make.  Without thinking it ends the
         prompt; with thinking, run() writes it once the thinking is over.  `image_access`: what this request's
         connection may name as an image; without one, the remote policy.  `fit` (the request's fit_max_tokens:
         true): this request's max_new is a cap, cut to the room the context leaves, as --fit-max-tokens
-        does for every request, instead of a 400."""
+        does for every request, instead of a 400. `cont` (the request's continue_final_message): see
+        continuation(); a continued text goes on as text (thinking is over), a continued thinking as thinking."""
         self.embeddings.path = None
         kwargs = self.thinking_kwargs(kwargs)
+        continued = self.continuation(messages, force, cont)
+        if continued == "empty":                        # nothing written yet: the answer starts as usual
+            messages, continued = messages[:-1], None
         try:
-            return self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources, fit)
+            ids, thinking, max_new = self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources,
+                                                   fit, continued)
+            return ids, thinking and continued != "content", max_new
         except BaseException:
             if self.embeddings.path:
                 Path(self.embeddings.path).unlink(missing_ok=True)
                 self.embeddings.path = None
             raise
 
-    def _prepare_text(self, messages, tools, kwargs, max_new, force, fit=False):
+    def _prepare_text(self, messages, tools, kwargs, max_new, force, fit=False, continued=None):
         """The text path: the engine tokenizes, so the server sends the rendered prompt as it is and settles the
         answer cap with the engine (clip: cut to the room the context leaves)."""
-        text, plain = self.render_text(messages, tools, kwargs)
+        text, plain = self.render_text(messages, tools, kwargs, continued)
         tail = force if force and kwargs.get("enable_thinking", True) is False else ""
         resumed = self._exact_resume(text, plain, tail)        # a follow-up reuses the whole engine cache
         if resumed is not None:
@@ -1413,7 +1453,7 @@ class Service:
         if not all(images):
             _refuse_images(IMAGE_USAGE)
 
-    def _prepare(self, messages, tools, kwargs, max_new, force, image_access, fit=False):
+    def _prepare(self, messages, tools, kwargs, max_new, force, image_access, fit=False, continued=None):
         media = media_of(messages)
         images = [item["source"] for item in media if item["type"] == "image"]
         videos = [item for item in media if item["type"] == "video"]
@@ -1422,13 +1462,13 @@ class Service:
         if videos:
             self._check_videos(videos)
         if not media and getattr(self.engine, "takes_text", False) and not getattr(self.engine, "batch", 0):
-            return self._prepare_text(messages, tools, kwargs, max_new, force, fit)
+            return self._prepare_text(messages, tools, kwargs, max_new, force, fit, continued)
         results, spliced = [], None
         if media:
             results = self._encode_media(media, images, videos, image_access)
             # each video's marker becomes its groups' text before the prompt is tokenized
             spliced = [self.dialect.video_text(r.times, r.rows) for r in results if not isinstance(r, int)] if videos else None
-        ids = self.encode_prompt(messages, tools, kwargs, spliced)
+        ids = self.encode_prompt(messages, tools, kwargs, spliced, continued)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(self.dialect.nothink_lead + force, parse_special=True)
         if images:
@@ -2161,6 +2201,27 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # draft counts only when reported
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
+
+
+def _message_text(content) -> str:
+    """A message's text: the string, or the text parts of a list."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text", "output_text"))
+    return ""
+
+
+def _cut_after(rendered: str, text: str) -> str:
+    """`rendered` cut right after the last place `text` stands in it, as Hugging Face's continue_final_message does:
+    with its trailing spaces when the template kept them, without when it trimmed them. ValueError when the template
+    does not show the text (it cannot be continued)."""
+    t = text.strip()
+    k = rendered.rfind(t) if t else -1
+    if k < 0:
+        raise ValueError("this model's template does not show the assistant message's text: it cannot be continued")
+    lead = text.lstrip()
+    return rendered[:k + (len(lead) if rendered[k:k + len(lead)] == lead else len(t))]
 
 
 def _refuse_images(why: str):

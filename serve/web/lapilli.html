@@ -99,6 +99,8 @@
               <svg class="ic"><use href="web/lapilli-icons.svg#i-exporter"/></svg></button>
             <button type="button" class="reglage-puce" id="btn-reglages" title="Response settings" aria-label="Response settings">
               <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-reglages"/></svg><span id="reglage-resume">Medium thinking</span></button>
+            <button type="button" class="reglage-puce jauge-puce" id="btn-jauge" title="Context" aria-label="Context use" hidden>
+              <svg class="jauge-anneau" viewBox="0 0 20 20" aria-hidden="true"><circle class="jauge-anneau__fond" cx="10" cy="10" r="7.5"/><circle class="jauge-anneau__arc" id="jauge-arc" cx="10" cy="10" r="7.5" pathLength="100"/></svg><span id="jauge-texte"></span></button>
             <span class="saisie__espace"></span>
             <span class="saisie__aide" id="saisie-aide">Shift+Enter: new line</span>
             <button type="button" class="btn btn--doux" id="btn-arreter" title="Stop the response" aria-label="Stop the response" hidden>
@@ -393,6 +395,50 @@
     </div>
     <div class="bascule-ligne"><span>Show thinking<br><span class="doux petit">open while it is being written</span></span>
       <button class="bascule" id="r-montrer" type="button" role="switch" aria-checked="true" aria-label="Show thinking"></button></div>
+    <div class="champ" id="bloc-jauge">
+      <span class="champ__libelle">Context use <output id="o-jauge"></output></span>
+      <div class="jauge-barre" id="jauge-barre-boite"><i id="jauge-barre"></i></div>
+      <span class="doux petit" id="jauge-note"></span>
+      <button class="btn btn--doux btn--petit" id="btn-compacter" type="button" disabled>
+        <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-compacter"/></svg>Compact conversation</button>
+      <span class="doux petit" id="compacter-note"></span>
+    </div>
+    <details class="avance" id="r-compaction">
+      <summary><span>Context compaction</span><svg class="ic ic--p chevron"><use href="web/lapilli-icons.svg#i-chevron"/></svg></summary>
+      <div class="avance__corps">
+        <div class="bascule-ligne"><span>Compact context automatically<br><span class="doux petit">Before a message is sent, when the context
+          reaches the threshold below, or leaves less than the room kept for the next response (below). The thinking of
+          earlier responses is left out first; the conversation is summarized when that is not enough.</span></span>
+          <button class="bascule" id="r-compaction-auto" type="button" role="switch" aria-checked="true" aria-label="Compact context automatically"></button></div>
+        <div class="bascule-ligne"><span>Continue a cut response automatically<br><span class="doux petit">When a response fills the context
+          after writing some text, its thinking is left out and it goes on in its bubble, when that frees room.</span></span>
+          <button class="bascule" id="r-suite-auto" type="button" role="switch" aria-checked="true" aria-label="Continue a cut response automatically"></button></div>
+        <div class="champ">
+          <label class="champ__libelle" for="r-compaction-seuil">Automatic compaction threshold (%)</label>
+          <input class="entree" id="r-compaction-seuil" type="number" min="1" max="100" step="1" inputmode="numeric">
+        </div>
+        <div class="champ">
+          <label class="champ__libelle" for="r-compaction-place">Room kept for the next response</label>
+          <select class="entree" id="r-compaction-place">
+            <option value="reponse">Longest response, thinking included</option>
+            <option value="texte">Longest response, text only</option>
+          </select>
+          <span class="doux petit">Thinking included: fewer cut responses, more summaries. Text only: the thinking adapts to the room
+            left, and the conversation is summarized only when its text no longer fits.</span>
+        </div>
+        <div class="champ">
+          <label class="champ__libelle" for="r-compaction-etapes">Compaction preserved steps</label>
+          <input class="entree" id="r-compaction-etapes" type="number" min="0" max="100" step="1" inputmode="numeric">
+          <span class="doux petit">Last steps a compaction keeps as written after the summary, without their thinking, as far as they
+            fit in half of the context. A step is a message of yours, or a response.</span>
+        </div>
+        <div class="champ">
+          <label class="champ__libelle" for="r-compaction-consigne">Compaction prompt</label>
+          <textarea class="entree entree--zone" id="r-compaction-consigne" rows="6" spellcheck="false"></textarea>
+          <span class="doux petit">The instruction sent to the model when compacting a conversation.</span>
+        </div>
+      </div>
+    </details>
     <details class="avance" id="r-avance">
       <summary><span>Advanced settings</span><svg class="ic ic--p chevron"><use href="web/lapilli-icons.svg#i-chevron"/></svg></summary>
       <div class="avance__corps">

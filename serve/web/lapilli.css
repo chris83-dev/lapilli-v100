@@ -279,7 +279,12 @@ div.outil__cle { margin: 0 0 6px; }
             color: var(--attente-texte); font-size: 13.5px; }
 .fin-note__texte { flex: 1 1 220px; display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
 .fin-note__texte .ic { flex: none; margin-top: 2px; }
-.fin-note .btn { height: 30px; padding: 0 12px; font-size: 13px; border-radius: 9px; margin-left: auto; }
+.fin-note .btn { height: 30px; padding: 0 12px; font-size: 13px; border-radius: 9px; }
+/* its buttons as one group: on the right of the text, or together on the next line, never split */
+.fin-note__actions { display: flex; gap: 8px; margin-left: auto; flex: none; }
+/* a link inside the notice: the accent colour is too close to the notice's own text in the light theme, so it
+   takes that text's colour and shows as a link by its underline */
+.fin-note a { color: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
 .erreur-msg { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: var(--r-m); background: var(--danger-teinte);
               color: var(--danger-texte); font-size: 14px; overflow-wrap: anywhere; }
 .erreur-msg .ic { flex: none; margin-top: 1px; }
@@ -313,6 +318,33 @@ div.outil__cle { margin: 0 0 6px; }
                 border: 1px solid var(--ligne); background: var(--surface-2); color: var(--encre-2); font: 500 13px/1.35 var(--police); cursor: pointer;
                 white-space: nowrap; overflow: hidden; }
 .reglage-puce span { overflow: hidden; text-overflow: ellipsis; }
+/* the context gauge and the conversation compaction, after llama.cpp's own (ui/apps/chat) */
+.jauge-puce { gap: 6px; padding: 0 10px; }
+.jauge-anneau { width: 16px; height: 16px; flex: none; transform: rotate(-90deg); }
+.jauge-anneau circle { fill: none; stroke-width: 3; }
+.jauge-anneau__fond { stroke: var(--ligne); }
+.jauge-anneau__arc { stroke: var(--accent); stroke-linecap: round; stroke-dasharray: 0 100; transition: stroke-dasharray var(--duree) var(--courbe); }
+.jauge-puce[data-niveau="haut"] .jauge-anneau__arc { stroke: var(--attente); }
+.jauge-barre { height: 6px; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
+.jauge-barre > i { display: block; height: 100%; width: 0; border-radius: 3px; background: var(--accent); transition: width var(--duree) var(--courbe); }
+.jauge-barre[data-niveau="haut"] > i { background: var(--attente); }
+#btn-compacter { align-self: flex-start; }
+.entree--zone { height: auto; min-height: 132px; padding: 10px 12px; line-height: 1.45; resize: vertical; }
+.msg--compaction { padding-left: 44px; }
+/* the node in the thread: one line like a thinking block, its summary folded under it, bounded when long */
+.compaction { border: 1px solid var(--ligne); border-radius: var(--r-m); background: var(--surface); overflow: hidden; }
+.compaction > summary { list-style: none; display: flex; align-items: center; gap: 9px; min-height: 40px; padding: 8px 12px; cursor: pointer;
+                        font-size: 13.5px; font-weight: 550; color: var(--encre-douce); user-select: none; }
+.compaction > summary::-webkit-details-marker { display: none; }
+.compaction > summary .ic:first-child { color: var(--lecture); }
+.compaction > summary .chevron { margin-left: auto; color: var(--encre-douce); transition: transform var(--duree) var(--courbe); }
+.compaction[open] > summary .chevron { transform: rotate(180deg); }
+.compaction[data-etat="cours"] > summary .ic:first-child { animation: pouls 1.2s ease-in-out infinite; }
+.compaction[data-etat="cours"] > summary .chevron { visibility: hidden; }
+.compaction__titre { min-width: 0; display: flex; flex-wrap: wrap; row-gap: 2px; font-variant-numeric: tabular-nums; }   /* wraps between its pieces */
+.compaction:not([open]) > .compaction__corps { display: none; }
+.compaction__corps { display: flex; flex-direction: column; gap: 6px; padding: 10px 14px 8px; border-top: 1px solid var(--ligne-douce); }
+.compaction__corps > .reponse { max-height: 340px; overflow-y: auto; font-size: 14px; color: var(--encre-2); scrollbar-width: thin; }
 .reglage-puce:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--ligne)); color: var(--encre); }
 .pieces { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 4px 0; }
 .piece { display: inline-flex; align-items: center; gap: 6px; height: 30px; max-width: 100%; padding: 0 4px 0 10px; border-radius: var(--r-pilule);
@@ -802,6 +834,7 @@ div.outil__cle { margin: 0 0 6px; }
   .suggestions { grid-template-columns: minmax(0, 1fr); }
   .msg--lapilli { grid-template-columns: minmax(0, 1fr); }
   .msg__avatar { display: none; }
+  .msg--compaction { padding-left: 0; }
   .faits { grid-template-columns: minmax(0, 1fr); gap: 2px 0; }
   .faits dd { margin-bottom: 10px; }
   .annonces { right: 16px; left: 16px; top: 68px; align-items: stretch; }

@@ -9,7 +9,10 @@ import os
 from pathlib import Path
 
 FILE = "lapilli-settings.json"
-DEFAULT_CONTEXT = 32768        # without a choice: enough for long conversations, light on the cards
+# without a choice. 65,536: 32,768 was short for code with thinking on Flash-Next (a model that
+# keeps earlier turns' thinking in its context filled it in two exchanges); the engines with elastic caches back only
+# their first 32,768 positions at start and grow on use
+DEFAULT_CONTEXT = 65536
 MIN_CONTEXT = 4096
 VISION_FLAG = "--vision"       # the engine's flag for the in-engine encoder (`--vision dynamic` at the server)
 

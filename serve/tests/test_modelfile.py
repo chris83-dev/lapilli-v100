@@ -234,7 +234,7 @@ class Cli(Tmp):
         self.assertEqual(mc.call_args.args[0].vision, False)
 
     def test_the_page_settings_order_at_start(self):
-        """(Lapilli) The command line wins, then what the page kept for this file, then the defaults (32K, images on)."""
+        """(Lapilli) The command line wins, then what the page kept for this file, then the defaults (64K, images on)."""
         from serve.engine import settings as page
         path = self.build(vision=True, meta={**META, "gguf_kv": {**META["gguf_kv"], "tiny.context_length": 65536}})
         base = ["--model", path, "--engine-bin", str(self.engine_bin), "--gpu", "0"]
@@ -246,7 +246,7 @@ class Cli(Tmp):
                 self.run_main(*base, *flags)
             return mc.call_args.args[0]
         s = spec_of()
-        self.assertEqual(page.context_of(list(s.engine_words)), 32768)
+        self.assertEqual(page.context_of(list(s.engine_words)), 65536)   # the default
         self.assertEqual(s.vision, "dynamic")
         store = modelfile.cache_dir(ModelFile(path)) / page.FILE
         page.save(store, {"max_context": 16384, "vision": "off"})
@@ -257,7 +257,7 @@ class Cli(Tmp):
         self.assertEqual(page.context_of(list(s.engine_words)), 8192)
         self.assertEqual(s.vision, "dynamic")
         page.save(store, {"max_context": 999999})       # longer than the file reads: the default instead
-        self.assertEqual(page.context_of(list(spec_of().engine_words)), 32768)
+        self.assertEqual(page.context_of(list(spec_of().engine_words)), 65536)
 
     def test_vision_without_sidecar_is_a_startup_error(self):
         path = self.build(vision=True)

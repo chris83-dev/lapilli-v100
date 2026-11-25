@@ -527,8 +527,8 @@ class EveryOption(unittest.TestCase):
     def test_every_server_option_by_both_paths(self):
         ap = build_parser()
         for name, act in server_options(ap).items():
-            # grammar is on by default: its no- form differs (test_grammar)
-            if name in ("api-key", "api-key-file", "engine-bin", "grammar"):
+            # grammar and prefill-assistant are on by default: their no- form differs (test_grammar, test_prefill_assistant)
+            if name in ("api-key", "api-key-file", "engine-bin", "grammar", "prefill-assistant"):
                 continue
             v = "localhost" if name == "host" else self.sample(act)
             if isinstance(act, argparse._AppendAction):

@@ -778,8 +778,12 @@ def make_handler(target: Service | Router):
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
+            cont = req.get("continue_final_message")          # llama.cpp's request field; absent: the server's setting
+            if cont is not None and not isinstance(cont, bool):
+                raise ValueError("continue_final_message: true or false")
             ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
-                                                 image_access=self._image_access(), fit=req.get("fit_max_tokens") is True)
+                                                 image_access=self._image_access(), fit=req.get("fit_max_tokens") is True,
+                                                 cont=cont)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
             chunks = primed(openai_chunks(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
@@ -974,7 +978,10 @@ def make_handler(target: Service | Router):
             messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)
             tools, _ = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)   # same 400 as the request itself ("none": no tools)
             stop_strings(req)                                 # same 400 as the request itself
-            self._json(200, {"input_tokens": len(self.svc.encode_prompt(messages, tools, kw))})
+            continued = self.svc.continuation(messages)         # Anthropic's prefill: a final assistant message goes on
+            if continued == "empty":
+                messages, continued = messages[:-1], None
+            self._json(200, {"input_tokens": len(self.svc.encode_prompt(messages, tools, kw, continued=continued))})
 
         def _anthropic(self, req):
             messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)

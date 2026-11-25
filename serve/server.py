@@ -418,6 +418,16 @@ def main() -> int:
     services = [build_model(m[0], cfg, logs, multi, known) for m, cfg in zip(settings, cfgs)]
     check_models(services)
     router = Router(services)
+    router.images = None
+    if getattr(a, "images_server", ""):              # (Lapilli, V100) images beside the chat (serve/images.py)
+        from serve.images import Images, ImagesConfig
+        if not a.images_models:
+            raise SystemExit("--images-server needs --images-models")
+        router.images = Images(ImagesConfig(server=a.images_server, models=a.images_models, card=a.images_card,
+                                            port=a.images_port, cap_gib=a.images_cap_gib), router)
+        for s in services:
+            s.release_gpu = router.images.release_gpu
+        print(tagged("images", f"{a.images_server} on card {a.images_card}, models {a.images_models}"), flush=True)
     svc = router.front
     svc.image_sources = image_sources
     if image_sources.url_hosts or image_sources.dirs or image_sources.remote_only:
@@ -553,7 +563,7 @@ def main() -> int:
     except KeyboardInterrupt:
         if not rc:
             print("[server] stopping (Ctrl+C again to force)", flush=True)
-        closers = [router.stop, httpd.shutdown]
+        closers = [router.stop, httpd.shutdown, router.images.close if router.images else None]
         for s in services:
             closers += [getattr(s.engine, "close", None), s.vision.close if s.vision else None]
         for close in filter(None, closers):

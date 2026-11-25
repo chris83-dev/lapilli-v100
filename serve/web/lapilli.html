@@ -22,6 +22,7 @@
 </script>
 <script defer src="web/marked.umd.js"></script>
 <script defer src="web/lapilli-monitor.js"></script>
+<script defer src="web/lapilli-images.js"></script>
 <script defer src="web/lapilli.js"></script>
 </head>
 <body>
@@ -32,13 +33,15 @@
   <a class="marque" href="#" id="marque" aria-label="Lapilli, go to chat">
     <img src="web/lapilli-logo.svg" alt="" width="28" height="28"><span>Lapilli</span></a>
   <nav class="onglets" role="tablist" aria-label="Views">
-    <button class="onglet" role="tab" id="onglet-discussion" data-vue="discussion" aria-controls="vue-discussion" aria-selected="true">
+    <button class="onglet" role="tab" id="onglet-discussion" data-vue="discussion" title="Chat" aria-label="Chat" aria-controls="vue-discussion" aria-selected="true">
       <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-discussion"/></svg><span>Chat</span></button>
-    <button class="onglet" role="tab" id="onglet-moniteur" data-vue="moniteur" aria-controls="vue-moniteur" aria-selected="false">
+    <button class="onglet" role="tab" id="onglet-images" data-vue="images" title="Images" aria-label="Images" aria-controls="vue-images" aria-selected="false" hidden>
+      <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-image"/></svg><span>Images</span></button>
+    <button class="onglet" role="tab" id="onglet-moniteur" data-vue="moniteur" title="Monitor" aria-label="Monitor" aria-controls="vue-moniteur" aria-selected="false">
       <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-moniteur"/></svg><span>Monitor</span></button>
-    <button class="onglet" role="tab" id="onglet-experts" data-vue="experts" aria-controls="vue-experts" aria-selected="false" hidden>
+    <button class="onglet" role="tab" id="onglet-experts" data-vue="experts" title="Experts" aria-label="Experts" aria-controls="vue-experts" aria-selected="false" hidden>
       <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-experts"/></svg><span>Experts</span></button>
-    <button class="onglet" role="tab" id="onglet-apropos" data-vue="apropos" aria-controls="vue-apropos" aria-selected="false">
+    <button class="onglet" role="tab" id="onglet-apropos" data-vue="apropos" title="About" aria-label="About" aria-controls="vue-apropos" aria-selected="false">
       <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-info"/></svg><span>About</span></button>
   </nav>
   <span class="entete__espace"></span>
@@ -109,6 +112,93 @@
               <svg class="ic"><use href="web/lapilli-icons.svg#i-envoyer"/></svg></button>
           </div>
         </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================ Images ================================ -->
+  <section class="vue vue--defile" id="vue-images" role="tabpanel" aria-labelledby="onglet-images" hidden>
+    <div class="imagier">
+      <form class="carte im-creer" id="im-form" autocomplete="off" novalidate>
+        <div class="carte__tete"><span class="carte__titre">Create an image</span><span class="doux petit im-moteur" id="im-moteur-note"></span></div>
+        <div class="champ">
+          <label class="champ__libelle" for="im-prompt">Prompt <output id="o-im-prompt"></output></label>
+          <textarea class="entree entree--zone im-prompt" id="im-prompt" rows="5" maxlength="4000"
+                    placeholder="Describe the image: its subject, the place, the light, the style…"></textarea>
+        </div>
+        <div class="champ">
+          <span class="champ__libelle" id="lib-im-refs">Reference images <output id="o-im-refs">optional</output></span>
+          <div class="im-refs" id="im-refs" role="list" aria-labelledby="lib-im-refs"></div>
+          <input type="file" id="im-fichiers" accept="image/png,image/jpeg,image/webp" multiple hidden>
+          <span class="doux petit" id="im-refs-note"></span>
+        </div>
+        <div class="champ">
+          <span class="champ__libelle" id="lib-im-modele">Model</span>
+          <div class="im-modeles" id="im-modele" role="radiogroup" aria-labelledby="lib-im-modele"></div>
+        </div>
+        <div class="champ">
+          <span class="champ__libelle" id="lib-im-format">Format <output id="o-im-format"></output></span>
+          <div class="im-formats" id="im-format" role="radiogroup" aria-labelledby="lib-im-format"></div>
+        </div>
+        <div class="champ" id="im-taille-champ">
+          <span class="champ__libelle" id="lib-im-taille">Size <output id="o-im-taille"></output></span>
+          <div class="segments segments--deux" id="im-taille" role="radiogroup" aria-labelledby="lib-im-taille">
+            <button type="button" role="radio" data-v="standard">Standard</button><button type="button" role="radio" data-v="grand">Large</button>
+          </div>
+        </div>
+        <div class="im-libre" id="im-libre" hidden>
+          <div class="champ"><label class="champ__libelle" for="im-largeur">Width</label>
+            <input class="entree" id="im-largeur" type="number" min="256" max="2816" step="32" inputmode="numeric"></div>
+          <div class="champ"><label class="champ__libelle" for="im-hauteur">Height</label>
+            <input class="entree" id="im-hauteur" type="number" min="256" max="2816" step="32" inputmode="numeric"></div>
+          <span class="doux petit im-libre__note" id="im-libre-note"></span>
+        </div>
+        <details class="avance" id="im-avance">
+          <summary><span>Advanced settings</span><svg class="ic ic--p chevron"><use href="web/lapilli-icons.svg#i-chevron"/></svg></summary>
+          <div class="avance__corps">
+            <div class="champ">
+              <span class="champ__libelle" id="lib-im-nombre">Number of images <output id="o-im-nombre"></output></span>
+              <div class="segments" id="im-nombre" role="radiogroup" aria-labelledby="lib-im-nombre">
+                <button type="button" role="radio" data-v="1">1</button><button type="button" role="radio" data-v="2">2</button><button type="button" role="radio" data-v="3">3</button><button type="button" role="radio" data-v="4">4</button>
+              </div>
+            </div>
+            <div class="champ">
+              <label class="champ__libelle" for="im-etapes">Steps <output id="o-im-etapes"></output></label>
+              <input class="curseur" type="range" id="im-etapes" min="4" max="100" step="1">
+            </div>
+            <div class="champ">
+              <label class="champ__libelle" for="im-guidage">Guidance <output id="o-im-guidage"></output></label>
+              <input class="curseur" type="range" id="im-guidage" min="1" max="20" step="0.5">
+            </div>
+            <div class="champ">
+              <label class="champ__libelle" for="im-negatif">Negative prompt <output>what to avoid</output></label>
+              <textarea class="entree entree--zone im-negatif" id="im-negatif" rows="2" maxlength="4000" placeholder="blurry, distorted text…"></textarea>
+            </div>
+            <span class="doux petit" id="im-turbo-note"></span>
+            <div class="champ">
+              <label class="champ__libelle" for="im-graine">Seed <output>empty: random</output></label>
+              <input class="entree" id="im-graine" type="number" min="0" step="1" placeholder="Random" inputmode="numeric">
+            </div>
+            <div><button class="btn btn--doux btn--petit" id="im-retablir" type="button">
+              <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-regenerer"/></svg>Reset</button></div>
+          </div>
+        </details>
+        <div class="carte__pied im-pied">
+          <button type="submit" class="btn btn--accent" id="im-generer">
+            <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-image"/></svg>Generate</button>
+          <button type="button" class="btn btn--doux" id="im-arreter" hidden>
+            <svg class="ic ic--p"><use href="web/lapilli-icons.svg#i-arreter"/></svg>Stop</button>
+          <span class="doux petit im-pied__note" id="im-pied-note"></span>
+        </div>
+      </form>
+
+      <div class="im-droite">
+        <div class="carte im-scene" id="im-scene"></div>
+        <div class="carte">
+          <div class="carte__tete"><span class="carte__titre">Gallery</span><span class="doux petit im-galerie-note" id="im-galerie-note"></span></div>
+          <div class="im-galerie" id="im-galerie"></div>
+          <div><button class="btn btn--doux btn--petit" id="im-plus" type="button" hidden>Show more</button></div>
+        </div>
       </div>
     </div>
   </section>
@@ -470,6 +560,26 @@
   </div>
 </aside>
 <div class="voile" id="voile" hidden></div>
+<!-- ================================ An image of the gallery, in full size ================================ -->
+<div class="im-visionneuse" id="im-visionneuse" role="dialog" aria-modal="true" aria-labelledby="iv-titre" hidden>
+  <div class="im-visionneuse__barre">
+    <span class="im-visionneuse__titre" id="iv-titre"></span>
+    <button class="btn btn--icone" id="iv-fermer" type="button" title="Close" aria-label="Close">
+      <svg class="ic"><use href="web/lapilli-icons.svg#i-croix"/></svg></button>
+  </div>
+  <div class="im-visionneuse__scene" id="iv-scene">
+    <button class="im-visionneuse__fleche im-visionneuse__fleche--g" id="iv-avant" type="button" title="Previous image" aria-label="Previous image">
+      <svg class="ic"><use href="web/lapilli-icons.svg#i-chevron"/></svg></button>
+    <img class="im-visionneuse__img" id="iv-img" alt="">
+    <button class="im-visionneuse__fleche im-visionneuse__fleche--d" id="iv-apres" type="button" title="Next image" aria-label="Next image">
+      <svg class="ic"><use href="web/lapilli-icons.svg#i-chevron"/></svg></button>
+  </div>
+  <div class="im-visionneuse__legende">
+    <p class="im-visionneuse__prompt" id="iv-prompt"></p>
+    <p class="im-visionneuse__infos petit" id="iv-infos"></p>
+    <div class="im-visionneuse__actions" id="iv-actions"></div>
+  </div>
+</div>
 <div class="annonces" id="annonces" aria-live="polite"></div>
 <noscript><p class="sans-js">This page needs JavaScript.</p></noscript>
 </body>

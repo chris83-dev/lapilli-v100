@@ -604,6 +604,18 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--prefill-assistant", action=argparse.BooleanOptionalAction, default=True,
                     help="a conversation that ends with an assistant message continues that message, as llama.cpp's server "
                          "does (on by default); --no-prefill-assistant answers after it instead")
+    # (Lapilli, V100) images beside the chat: stable-diffusion.cpp's sd-server as a second engine (serve/images.py)
+    ap.add_argument("--images-server", default="", metavar="EXE",
+                    help="sd-server (stable-diffusion.cpp): images beside the chat, on the same cards, one engine at a time; "
+                         "the page's Images tab and POST /v1/images/generations")
+    ap.add_argument("--images-models", default="", metavar="DIR",
+                    help="the image models directory (diffusion_models/, text_encoders/, vae/) for --images-server")
+    ap.add_argument("--images-card", type=int, default=0, metavar="N",
+                    help="the one card the image server may use (default 0)")
+    ap.add_argument("--images-port", type=int, default=8099, metavar="PORT",
+                    help="the image server's port, on 127.0.0.1 only (default 8099)")
+    ap.add_argument("--images-cap-gib", type=int, default=40, metavar="GIB",
+                    help="Windows: the hard cap of the image server's working set, from its start (default 40)")
     ap.add_argument("--grammar", action=argparse.BooleanOptionalAction, default=GRAMMAR_DEFAULT,
                     help="hold every tool call and JSON response format to a grammar in the engine (on by default; a request "
                          "with strict: true gets it either way); --no-grammar turns it off")

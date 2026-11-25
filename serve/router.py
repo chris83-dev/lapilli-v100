@@ -101,7 +101,8 @@ class Router:
                        for t in self.queue if t.holds]
         m["live"]["queued"] += len(waiting)
         m["live"]["queue"] = m["live"]["queue"] + waiting
-        return {**m, "models": self.models(), "swap": self.swap_status()}
+        im = getattr(self, "images", None)          # images beside the chat: what the cards make, for the status pill
+        return {**m, "models": self.models(), "swap": self.swap_status(), **({"images": im.summary()} if im is not None else {})}
 
     def join(self, svc) -> Turn:
         """Take a turn for `svc`: granted at once when its model is loaded and nothing waits, else queued."""

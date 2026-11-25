@@ -388,6 +388,19 @@ def make_handler(target: Service | Router):
             elif path == "/api/engine-settings":           # (Lapilli) the page's Engine settings
                 if self._authorized():
                     self._json(200, router.shown().engine_settings())
+            elif path == "/api/images":                      # (Lapilli, V100) the Images tab: what it can do, its jobs
+                if self._authorized():
+                    im = getattr(router, "images", None)
+                    self._json(200, im.state() if im else {"configured": False})
+            elif path.startswith("/api/images/jobs/"):       # one job; ?images=0 leaves its images out (polling)
+                if self._authorized():
+                    im = getattr(router, "images", None)
+                    job = im.get(path[len("/api/images/jobs/"):]) if im else None
+                    if job is None:
+                        self._json(404, {"error": {"message": "no such image job"}})
+                    else:
+                        q = parse_qs(urlsplit(self.path).query)
+                        self._json(200, job.view(with_images=q.get("images", ["1"])[0] != "0"))
             elif path in ("", "/dashboard"):
                 # "/" serves the Lapilli chat page; Basalt's dashboard stays at /dashboard
                 body = (ROOT / "serve" / "web" / ("index.html" if path == "/dashboard" else "lapilli.html")).read_bytes()
@@ -507,6 +520,42 @@ def make_handler(target: Service | Router):
                             target.fifo.release()
                         result = "loaded"
                     self._json(200, {"status": result, **target.v1_status()})
+                    return
+                if path == "/api/images/jobs" or (path.startswith("/api/images/jobs/") and path.endswith("/cancel")):
+                    # (Lapilli, V100) the Images tab: a job (it takes the cards from the chat), or its cancel
+                    if not self._own_page("images can be made"):
+                        return
+                    im = getattr(router, "images", None)
+                    if im is None:
+                        self._json(404, {"error": {"message": "images are not set up on this server (--images-server)"}})
+                        return
+                    if path == "/api/images/jobs":
+                        from serve.images import check
+                        self._json(202, im.submit(check(req)).view(with_images=False))
+                    else:
+                        job = im.cancel(path[len("/api/images/jobs/"):-len("/cancel")])
+                        if job is None:
+                            self._json(404, {"error": {"message": "no such image job"}})
+                        else:
+                            self._json(200, job.view(with_images=False))
+                    return
+                if path == "/v1/images/generations":          # (Lapilli, V100) OpenAI's images API, for any client
+                    im = getattr(router, "images", None)
+                    if im is None:
+                        self._json(404, {"error": {"message": "images are not set up on this server (--images-server)"}})
+                        return
+                    from serve.images import openai_params
+                    job = im.submit(openai_params(req), source="openai")
+                    cancel = self._client_cancel()
+                    while not im.wait(job, 1.0):
+                        if cancel.is_set():                  # the client left: its job goes too
+                            im.cancel(job.id)
+                            raise ClientGone
+                    if job.state == "completed":
+                        self._json(200, {"created": int(job.finished or time.time()), "output_format": "png",
+                                         "data": [{"b64_json": b} for b in job.images]})
+                    else:
+                        self._json(500, {"error": {"type": "server_error", "message": job.error or job.state}})
                     return
                 if path == "/api/pricing":
                     if not self._own_page("pricing can be changed"):

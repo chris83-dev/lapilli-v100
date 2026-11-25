@@ -74,6 +74,7 @@ class Service:
     loading = booting = False                      # a load or wake runs; the start-up load runs
     load_kind = "weights"                               # what the running load is: "weights" or "wake"
     on_loaded = None                                    # called after each weights load or wake this service ran
+    release_gpu = None                                  # (Lapilli, V100) frees the cards before a load: the image server
     boot_error = None                                   # the start-up load's failure, for the requests queued behind it
     start_tries = None                                  # tries of a load other than the start-up's (None: the engine's)
 
@@ -349,6 +350,8 @@ class Service:
             self._wake()
         if self.loaded() and not self._vision_down():
             return
+        if self.release_gpu is not None:                # (Lapilli, V100) the image server leaves the cards first
+            self.release_gpu()
         if self.before_load:
             cmd = self.before_load
             print(f"[server] before_load: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)

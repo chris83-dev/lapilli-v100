@@ -1,4 +1,4 @@
-// Lapilli: the chat page of the Basalt port to NVIDIA V100 GPUs (Chat, Monitor, About).
+// Lapilli: the chat page of the Basalt port to NVIDIA V100 GPUs (Chat, Images, Monitor, Experts, About).
 // No framework; nothing is sent anywhere but to this server. The layout follows that of Strata's page
 // (Niko1221, MIT license); text is formatted by marked (MIT license, web/marked.umd.js).
 "use strict";
@@ -104,7 +104,7 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
   if (garde !== "dark" && garde !== "light") poserTheme(e.matches ? "dark" : "light", false);
 });
 
-const VUES = ["discussion", "moniteur", "experts", "apropos"];
+const VUES = ["discussion", "images", "moniteur", "experts", "apropos"];
 let vue = "discussion";
 function montrerVue(nom) {
   const [v, sous] = String(nom || "").split("/");     // #moniteur/requetes: the Monitor, on its Requests section
@@ -121,6 +121,7 @@ function montrerVue(nom) {
   if (mesures) dessinerMesures(mesures);
   if (vue === "experts" && mesures && !mesures.experts_map) relever();   // its map now, not at the next reading
   if (vue === "apropos") lireReglagesMoteur();
+  if (vue === "images") Imagier.montrer();
 }
 for (const b of document.querySelectorAll(".onglet")) b.onclick = () => montrerVue(b.dataset.vue);
 window.addEventListener("hashchange", () => montrerVue(location.hash.slice(1)));
@@ -388,7 +389,7 @@ $("m-appliquer").onclick = async () => {
 // compares the files it was given with the ones the server gives now: once at start (the reference), every five
 // minutes, when the tab comes back, and when the server restarts. When they differ, a notice offers to reload, never
 // while a response or a compaction is being written. Closed, it comes back only for a newer change.
-const FICHIERS_PAGE = ["./", "web/lapilli.js", "web/lapilli-monitor.js", "web/lapilli.css"];
+const FICHIERS_PAGE = ["./", "web/lapilli.js", "web/lapilli-monitor.js", "web/lapilli-images.js", "web/lapilli.css"];
 let empreintePage = null, empreinteNeuve = null, empreinteFermee = null, verifPage = 0, verifEnVol = false, depuisServeur = null, avisPage = null;
 function empreinte(texte) {                       // FNV-1a on 32 bits: enough to tell two versions of the page apart
   let h = 0x811c9dc5;
@@ -468,7 +469,21 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) rele
 
 function poserPastille(etat, texte) {
   $("pastille").dataset.etat = etat;
-  $("pastille-texte").textContent = texte;
+  // its first word in a piece of its own that does not shrink: on a narrow header the rest gives way ("Thinking ·…"),
+  // never the word ("Thinki…"); the text stays whole for whoever reads it (textContent)
+  const el = $("pastille-texte"), t = String(texte), i = t.search(/[\s·]/);
+  if (el.textContent === t) return;
+  el.textContent = "";
+  const mot = document.createElement("span");
+  mot.className = "pastille__mot";
+  mot.textContent = i < 0 ? t : t.slice(0, i);
+  el.appendChild(mot);
+  if (i >= 0) {
+    const reste = document.createElement("span");
+    reste.className = "pastille__reste";
+    reste.textContent = t.slice(i);
+    el.appendChild(reste);
+  }
 }
 // the share of the message already read, estimated: elapsed time times the mean speed of this read
 function partLue(live) {
@@ -486,6 +501,9 @@ function etatDe(live) {
 }
 function dessinerPastille(m) {
   const live = m.live || {};
+  // the GPUs make an image (the image server holds them): the pill says so, from every tab
+  const image = Imagier.pastille(m);
+  if (image) { poserPastille(image.etat, image.texte); return; }
   const e = etatDe(live);
   const pct = (live.load || {}).percent;
   const lu = partLue(live);
@@ -494,11 +512,14 @@ function dessinerPastille(m) {
     lecture: `Reading${lu != null ? ` · ${nf(lu * 100)}%` : ""}`,
     reflexion: `Thinking${live.tok_s ? ` · ${nf(live.tok_s, 1)} tokens/s` : ""}`,
     ecriture: `Writing${live.tok_s ? ` · ${nf(live.tok_s, 1)} tokens/s` : ""}`,
-    attente: live.state === "unloaded" ? "Model unloaded" : live.state === "asleep" ? "Asleep" : `Waiting · ${nf(live.queued)}`,
+    attente: live.state === "unloaded" ? (m.images && m.images.server === "ready" ? "Image model loaded" : "Model unloaded")
+      : live.state === "asleep" ? "Asleep" : `Waiting · ${nf(live.queued)}`,
     repos: "Idle",
   };
   let t = textes[e] || "Idle";
   if (live.queued > 0 && e !== "attente") t += ` · ${nf(live.queued)} waiting`;
+  const im = m.images, enAttente = im ? (im.job ? 1 : 0) + (im.queued || 0) : 0;   // images waiting for the GPUs
+  if (enAttente) t += ` · ${nf(enAttente)} ${enAttente > 1 ? "images" : "image"} waiting`;
   poserPastille(e, t);
 }
 
@@ -510,6 +531,7 @@ const nomProcesseur = (st) => {
   return n.replace(/\((R|TM)\)/gi, "").replace(/\s+\d+-Core Processor$/i, "").replace(/\s+CPU\s+@.*$/i, "").replace(/\s+/g, " ").trim();
 };
 Moniteur.init();
+Imagier.init();
 
 function faits(el, lignes) {
   el.innerHTML = lignes.filter((l) => l[1] != null && l[1] !== "").map(([k, v, copie]) => `<dt>${esc(k)}</dt><dd>${copie
@@ -564,6 +586,10 @@ function dessinerMesures(m) {
   const experts = Moniteur.aDesExperts(m);
   $("onglet-experts").hidden = !experts;
   if (!experts && vue === "experts") { montrerVue("moniteur"); return; }
+  // the Images tab: only for a server that makes images (--images-server)
+  $("onglet-images").hidden = !m.images;
+  if (!m.images && vue === "images") { montrerVue("discussion"); return; }
+  Imagier.mesures(m);
   if (vue === "moniteur") Moniteur.dessiner(m);
   if (vue === "experts") Moniteur.dessinerExperts(m);
   if (vue === "apropos") dessinerApropos(m);

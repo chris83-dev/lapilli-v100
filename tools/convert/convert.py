@@ -292,6 +292,9 @@ class Job:
     def hc8(self):
         """The `hc8` section, from the `dense` and `mtp/dense` sections already written."""
         t = time.time()
+        if self.dry:  # nothing has been written to read the dense sections back from
+            print(f"  {'hc8':<44}   (built from the dense sections; not sized in a dry run)", flush=True)
+            return
         self.w.f.flush()
         at = {e[0]: (e[1], e[2]) for e in self.w.entries}
         with open(self.w.path, "rb") as f:

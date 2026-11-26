@@ -48,6 +48,16 @@ const Imagier = (() => {
   let montres = PAR_PAGE;
   let scene = {mode: "", cle: "", url: null, choix: 0};
   let resume = null;               // /metrics' "images": the job using the GPUs, whoever sent it
+  // (Lapilli) "Install": a model chosen while it is not installed shows its install; the install the server runs
+  // is read again every second while it lasts; its end (done, failed, stopped) is told once
+  const EN_COURS = ["starting", "checking", "downloading", "retrying", "converting", "verifying", "extracting"];
+  let choixAbsent = false;         // a model not installed was chosen on purpose: kept (lireEtat would pick an installed one)
+  const installe = {vu: null, minuterie: null};
+  // sizes as the rest of the page and Windows show them (lapilli.js's go(): binary GB); never a name of its own called go,
+  // which hid lapilli.js's (the loading step's "7.1 of 20.9 GB" changed with it: the bench saw it)
+  const gb = (n) => `${go(n, n >= 100 * 1073741824 ? 0 : 1)} GB`;
+  // the install the server offers for a model not installed: something to download, or a refusal to tell; never "0 file"
+  const planDe = (m) => (!m.available && m.install && (m.install.files > 0 || m.install.blocked) ? m.install : null);
   const iv = {index: -1, url: null, retour: null};
 
   const lim = () => ({...LIMITES, ...((etat && etat.limits) || {})});
@@ -167,7 +177,10 @@ const Imagier = (() => {
     $("im-modele").innerHTML = ks.map((k) => `<button type="button" role="radio" class="im-modele" data-v="${esc(k)}">` +
       `<span class="im-modele__tete"><span class="im-modele__nom">${esc(modele(k).label)}</span><span class="im-modele__pas"></span></span>` +
       `<span class="im-modele__aide"></span></button>`).join("");
-    for (const b of $("im-modele").children) b.onclick = () => { reglages.modele = b.dataset.v; garder(); dessinerForm(); };
+    for (const b of $("im-modele").children) b.onclick = () => {
+      if (reglages.modele !== b.dataset.v) $("im-inst-accord").checked = false;   // the licenses accepted for this model only
+      reglages.modele = b.dataset.v; choixAbsent = !modele(b.dataset.v).available; garder(); dessinerForm();
+    };
   }
 
   function dessinerForm() {
@@ -175,11 +188,17 @@ const Imagier = (() => {
     construireModeles();
     for (const b of $("im-modele").children) {
       const k = b.dataset.v, m = modele(k);
-      b.disabled = !m.available;
+      const plan = planDe(m);
+      b.disabled = !m.available && !plan;
+      b.classList.toggle("im-modele--absent", !m.available);
       b.querySelector(".im-modele__pas").textContent = m.kind === "video" ? `video · ${nf(etapesDe(k))} steps` : `${nf(etapesDe(k))} steps`;
-      b.querySelector(".im-modele__aide").textContent = m.available ? m.description : "Its files are not on the server.";
+      const aide = b.querySelector(".im-modele__aide");
+      if (m.available) aide.textContent = m.description;
+      else if (plan) aide.innerHTML = morceaux(["Not installed yet", `${gb(plan.download)} to download`]);
+      else aide.textContent = "Its files are not on the server.";
     }
     cocher($("im-modele"), reglages.modele);
+    dessinerInstallation();
     // "Same shape as the reference": offered once there is a reference image, its shape drawn from it
     const bRef = $("im-format").querySelector('[data-v="reference"]');
     if (!refs.length && reglages.format === "reference") { reglages.format = "1:1"; garder(); }
@@ -377,7 +396,8 @@ const Imagier = (() => {
     const m = modele(reglages.modele);
     const [l, h] = taille();
     const video = m.kind === "video";
-    const non = !m.available ? `${m.label}: its files are not on the server.` : m.refs === "required" && !refs.length
+    const non = !m.available ? (planDe(m) ? `${m.label} is not installed yet: install it above.` : `${m.label}: its files are not on the server.`)
+      : m.refs === "required" && !refs.length
       ? `The ${m.label} model edits images: add the image to edit.` : refs.length > maxRefs(m)
       ? "A video starts from one image: remove the others." : refusTaille(l, h);
     if (non) { annonce("alerte", video ? "This video cannot be made" : "This image cannot be made", non, 6000); return; }
@@ -1117,16 +1137,114 @@ const Imagier = (() => {
   }
   const aller = (d) => { const i = iv.index + d; if (i >= 0 && i < galerie.length) { iv.index = i; dessinerVisionneuse(); } };
 
+  // ------------------------------------------------------------------ the install of a model
+  // what the panel under the model list shows: the install running (whatever model is chosen), else the chosen model's install
+  // when it is not installed; nothing for an installed model
+  function dessinerInstallation() {
+    const box = $("im-installer"), j = etat && etat.install_job, m = modele(reglages.modele);
+    const enCours = !!j && EN_COURS.includes(j.state), plan = planDe(m);
+    box.hidden = !enCours && !plan;
+    if (box.hidden) return;
+    $("im-inst-barre").hidden = !enCours;
+    $("im-inst-licences").hidden = enCours;
+    $("im-inst-accord-ligne").hidden = enCours || !!plan.blocked;
+    $("im-inst-go").hidden = enCours;
+    $("im-inst-stop").hidden = !enCours;
+    const note = $("im-inst-note");
+    if (enCours) {
+      $("im-inst-titre").textContent = `Installing ${j.label}`;
+      $("im-inst-taille").textContent = `${gb(j.done)} of ${gb(j.total)}`;
+      $("im-inst-plein").style.width = `${j.total ? Math.min(100, (100 * j.done) / j.total) : 0}%`;
+      const quoi = {starting: "Starting", checking: "Checking what an earlier install left", downloading: j.file,
+                    retrying: "The connection was cut: trying again", converting: "Making the model's file, about 2 min",
+                    verifying: "Checking the model's file",
+                    extracting: "Unpacking ffmpeg"}[j.state];
+      const vite = j.state === "downloading" && j.speed;
+      $("im-inst-infos").innerHTML = morceaux([j.step ? `File ${nf(j.step)} of ${nf(j.steps)}` : "", quoi,   // not "File 0 of 4" at the start
+        vite ? `${nf(j.speed / 1e6)} MB/s` : "", vite && j.left_s != null ? `about ${duree(j.left_s)} left` : ""]);
+      note.hidden = true;
+      return;
+    }
+    $("im-inst-titre").textContent = `Install ${m.label}`;
+    $("im-inst-taille").textContent = gb(plan.download);
+    $("im-inst-infos").innerHTML = morceaux([`${nf(plan.files)} ${plan.files > 1 ? "files" : "file"}`,
+      `${gb(plan.disk)} needed on the disk`, `${gb(plan.free)} free`]);
+    $("im-inst-licences").innerHTML = `<span class="im-installer__lib">Licenses:</span>` + (plan.licenses || []).map((x) =>
+      `<span class="morceau"><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.name)}</a></span>`).join("");
+    note.hidden = !plan.blocked && !plan.convert;
+    note.dataset.ton = plan.blocked ? "alerte" : "";
+    note.textContent = plan.blocked || "Its file is made here from the release's BF16 file, in about 2 min.";
+    const bouton = $("im-inst-go");
+    bouton.textContent = `Install · ${gb(plan.download)}`;
+    bouton.disabled = !!plan.blocked || !$("im-inst-accord").checked;
+    bouton.title = plan.blocked ? plan.blocked : $("im-inst-accord").checked ? "" : "Accept the licenses first";
+  }
+
+  async function installer() {
+    const k = reglages.modele, m = modele(k);
+    if (!$("im-inst-accord").checked || $("im-inst-go").disabled) return;
+    $("im-inst-go").disabled = true;
+    try {
+      const r = await fetch("api/images/install", {method: "POST", headers: entetes(true), body: JSON.stringify({model: k, accept: true}),
+                                                    signal: delai(30000)});
+      if (!r.ok) throw await refus(r);
+      etat.install_job = await r.json();
+      installe.vu = etat.install_job.state;
+      $("im-inst-accord").checked = false;
+      suivreInstallation();
+    } catch (e) {
+      annonce("erreur", `${m.label} could not be installed`, e.message || String(e), 8000);
+    }
+    dessinerInstallation();
+  }
+
+  async function annulerInstallation() {
+    $("im-inst-stop").disabled = true;
+    try {
+      const r = await fetch("api/images/install/cancel", {method: "POST", headers: entetes(true), body: "{}", signal: delai(15000)});
+      if (!r.ok) throw await refus(r);
+    } catch (e) {
+      annonce("erreur", "The install could not be stopped", e.message || String(e), 6000);
+    }
+    $("im-inst-stop").disabled = false;
+    suivreInstallation(true);
+  }
+
+  // read the server again while an install lasts (every second; every 4 s in a hidden tab)
+  function suivreInstallation(quandMeme = false) {
+    clearTimeout(installe.minuterie);
+    const j = etat && etat.install_job;
+    if (!quandMeme && !(j && EN_COURS.includes(j.state))) return;
+    installe.minuterie = setTimeout(lireEtat, document.hidden ? 4000 : 1000);
+  }
+
+  function finInstallation(j) {
+    if (j.state === "done") {
+      annonce("succes", `${j.label} is installed`, "", 8000);
+      if (modele(j.model).available) { reglages.modele = j.model; choixAbsent = false; garder(); }
+    } else if (j.state === "failed") {
+      annonce("erreur", `${j.label} could not be installed`, phrase(j.error), 12000);
+    } else if (j.state === "cancelled") {
+      annonce("info", "The install was stopped", j.label, 6000);
+    }
+  }
+
   // ------------------------------------------------------------------ the server's state
   async function lireEtat() {
     try {
       const r = await fetch("api/images", {cache: "no-store", headers: entetes()});
       if (!r.ok) throw await refus(r);
       etat = await r.json();
-      if (!modele(reglages.modele).available) {           // the chosen model is not on the server: the first one that is
+      if (!modele(reglages.modele).available && !choixAbsent) {   // the chosen model is not on the server: the first one that is
         const k = listeModeles().find((x) => modele(x).available);
         if (k) reglages.modele = k;
       }
+      const j = etat.install_job, avant = installe.vu;
+      const fin = j && avant && EN_COURS.includes(avant) && !EN_COURS.includes(j.state);
+      if (fin) finInstallation(j);
+      installe.vu = j ? j.state : null;
+      if (j && EN_COURS.includes(j.state)) suivreInstallation();
+      else if (fin) suivreInstallation(true);              // once more after its end: the folder as the server sees it now
       lireNote();
       // a job of this page that the server still runs (sent from another tab, or before a reload)
       if (!travail && Array.isArray(etat.jobs)) {
@@ -1164,6 +1282,9 @@ const Imagier = (() => {
       ajouterRefs(fs, "pasted image");
     });
     $("im-negatif").addEventListener("input", () => { reglages.negatif = $("im-negatif").value; garder(false); });
+    $("im-inst-go").onclick = installer;
+    $("im-inst-stop").onclick = annulerInstallation;
+    $("im-inst-accord").addEventListener("change", dessinerInstallation);
     for (const b of $("im-format").children) b.onclick = () => { reglages.format = b.dataset.v; garder(); dessinerForm(); };
     for (const b of $("im-taille").children) b.onclick = () => { reglages.taille = b.dataset.v; garder(); dessinerForm(); };
     for (const b of $("im-nombre").children) b.onclick = () => { reglages.nombre = +b.dataset.v; garder(); dessinerForm(); };

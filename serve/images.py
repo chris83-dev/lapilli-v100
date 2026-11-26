@@ -19,6 +19,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -29,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from serve.engine import lifeline
+from serve.images_install import Installer, ffmpeg_path, sd_cli_next_to
 
 # The models the page and the API can ask for, in the order the page shows them. Each one: sd-server's recipe,
 # its own files by slot (a name pattern in the slot's folder of the model directory: the first file that matches, by name;
@@ -338,6 +340,8 @@ class Images:
         self.wake = threading.Condition(self.lock)
         self.ids = itertools.count(1)
         self.closing = False
+        # (Lapilli) the tab's "Install": a model's files from the catalog, into the model folder
+        self.installer = Installer(cfg.models, sd_cli_next_to(cfg.server), cap=lambda proc: _cap(proc, cfg.cap_gib, "sd-cli"))
         self.worker = threading.Thread(target=self._work, name="images", daemon=True)
         self.worker.start()
 
@@ -345,37 +349,79 @@ class Images:
     def files(self) -> dict:
         """Each model's catalog files by slot (relative ids, as sd-server lists them), for the models whose required files are
         all there; the vision projector only when found (editing needs it); its LoRA files under "@loras" (file names in loras/)."""
-        root = Path(self.cfg.models)
         out = {}
+        ffmpeg = self.ffmpeg()
         for name, m in MODELS.items():
-            slots = {}
-            for slot, pattern in m["files"].items():
-                folder, glob = pattern.split("/", 1)
-                found = [f for f in sorted((root / folder).glob(glob)) if f.is_file()
-                         and (slot != "llm" or "mmproj" not in f.name.lower())]
-                if found:
-                    slots[slot] = f"{folder}/{found[0].name}"
-            loras = []
-            for lo in m.get("loras", ()):
-                folder, glob = lo["file"].split("/", 1)
-                found = [f for f in sorted((root / folder).glob(glob)) if f.is_file()]
-                if found:
-                    loras.append((found[0].name, lo["multiplier"]))
+            slots, loras = self._found(m)
             if (all(k in slots for k in m.get("required", REQUIRED_SLOTS)) and (m["refs"] != "required" or "llm_vision" in slots)
                     and len(loras) == len(m.get("loras", ()))
-                    and (m.get("kind") != "video" or (self.cfg.ffmpeg and Path(self.cfg.ffmpeg).is_file()))):
+                    and (m.get("kind") != "video" or ffmpeg)):
                 out[name] = {**slots, **({"@loras": loras} if loras else {})}
         return out
 
+    def _found(self, m: dict) -> tuple[dict, list]:
+        """A model's files in the folder: its slots (the first file that matches each, by name) and its LoRAs."""
+        root = Path(self.cfg.models)
+        slots = {}
+        for slot, pattern in m["files"].items():
+            folder, glob = pattern.split("/", 1)
+            found = [f for f in sorted((root / folder).glob(glob)) if f.is_file()
+                     and (slot != "llm" or "mmproj" not in f.name.lower())]
+            if found:
+                slots[slot] = f"{folder}/{found[0].name}"
+        loras = []
+        for lo in m.get("loras", ()):
+            folder, glob = lo["file"].split("/", 1)
+            found = [f for f in sorted((root / folder).glob(glob)) if f.is_file()]
+            if found:
+                loras.append((found[0].name, lo["multiplier"]))
+        return slots, loras
+
+    def ffmpeg(self) -> str | None:
+        """the ffmpeg of the videos: the one given (--images-ffmpeg), else the one Install put in the model folder,
+        else the system's (PATH); nothing when none is there (the video models are then not offered)."""
+        if self.cfg.ffmpeg:
+            return self.cfg.ffmpeg if Path(self.cfg.ffmpeg).is_file() else None
+        p = ffmpeg_path(self.cfg.models)
+        return str(p) if p.is_file() else shutil.which("ffmpeg")
+
+    # ------------------------------------------------------------------------------------------------ the install
+    def _plan(self, name: str) -> dict | None:
+        slots, loras = self._found(MODELS[name])
+        return self.installer.plan(name, slots, [n for n, _ in loras], self.ffmpeg() is not None)
+
+    def install(self, name: str, accept) -> dict:
+        """Start installing a model from the catalog (images_install), or refuse with the reason (a ValueError, a 400)."""
+        if name not in MODELS:
+            raise ImagesError(f"unknown model: {name!r}")
+        return self.installer.start(name, MODELS[name]["label"], self._plan(name), accept, done=self._installed)
+
+    def install_cancel(self) -> dict | None:
+        return self.installer.cancel()
+
+    def _installed(self) -> None:
+        """After an install: an idle sd-server is stopped, so that its next start sees the new files."""
+        with self.lock:
+            busy = any(j.state in ("waiting", "switching", "starting", "generating") for j in self.jobs.values())
+        if not busy and self._alive():
+            self.stop()
+
     def state(self) -> dict:
+        # (seen in a real test) the install's state FIRST: a "done" install has put all its files when it
+        # says so, so the files read after it include them (read the other way round, a model just installed was still
+        # "Not installed yet · 0.0 GB" for one reading: its last file arrived between the two)
+        install_job = self.installer.view()
         files = self.files()
         with self.lock:
             # without their previews: a stopped or failed job keeps its last one (its own route gives it), forty of them
             # would weigh hundreds of KB here
             jobs = [{k: v for k, v in self.jobs[i].view(with_images=False).items() if k != "preview"} for i in self.order[:JOBS_KEPT]]
             server = self.server_state if self._alive() else "stopped"
+        install = {k: self._plan(k) for k in MODELS if k not in files}
         return {"configured": True, "server": server, "card": self.cfg.card,
+                "install_job": install_job,
                 "models": {k: {"label": v["label"], "description": v["description"], "available": k in files,
+                               "install": None if install.get(k) is None else {x: y for x, y in install[k].items() if x != "names"},
                                "steps": v["steps"], "cfg": v["cfg"], "fixed": v["fixed"], "refs": v["refs"],
                                "edit": "llm_vision" in files.get(k, {}) or v.get("kind") == "video", "fast": bool(v.get("loras")),
                                "refs_area_max": v.get("refs_area_max"), "area_max": v.get("area_max"),
@@ -588,7 +634,7 @@ class Images:
             # "scale=out_range=tv": the MJPEG frames are full range; ffmpeg 8 keeps it in the MP4 (yuvj420p, measured)
             # where many players show it washed out or too dark: the standard range, the same colors (2 of 255 apart,
             # as the full range: the compression's), 10 % lighter
-            r = subprocess.run([self.cfg.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(src),
+            r = subprocess.run([self.ffmpeg() or "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(src),
                                 "-vf", "scale=out_range=tv", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-preset", "medium",
                                 "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(dst),
                                 "-map", "0:v:0", "-frames:v", "1", "-q:v", "3", str(img)],
@@ -732,7 +778,7 @@ def _read_bytes(proc) -> int | None:
     return None
 
 
-def _cap(proc, gib: int) -> None:
+def _cap(proc, gib: int, what: str = "image server") -> None:
     """Windows: a hard cap of the process's working set (the machine's RAM is shared); elsewhere nothing."""
     if os.name != "nt" or proc is None:
         return
@@ -740,4 +786,4 @@ def _cap(proc, gib: int) -> None:
     k32 = ctypes.windll.kernel32
     ok = k32.SetProcessWorkingSetSizeEx(ctypes.c_void_p(int(proc._handle)), ctypes.c_size_t(64 << 20),
                                         ctypes.c_size_t(int(gib) << 30), 0x2 | 0x4)
-    print(f"[server] image server working set cap {gib} GiB: {'set' if ok else 'NOT set'}", flush=True)
+    print(f"[server] {what} working set cap {gib} GiB: {'set' if ok else 'NOT set'}", flush=True)

@@ -419,10 +419,15 @@ def main() -> int:
     check_models(services)
     router = Router(services)
     router.images = None
-    if getattr(a, "images_server", ""):              # (Lapilli, V100) images beside the chat (serve/images.py)
+    images_server = getattr(a, "images_server", "") or ""
+    if images_server == "off":
+        images_server = ""
+    elif not images_server:                          # (Lapilli) the sd-server shipped next to basalt: the tab by itself
+        images_server = next((str(c) for c in (ROOT / "bin" / "sd-server.exe", ROOT / "bin" / "sd-server") if c.is_file()), "")
+    if images_server:                                # (Lapilli, V100) images beside the chat (serve/images.py)
         from serve.images import Images, ImagesConfig
-        if not a.images_models:
-            raise SystemExit("--images-server needs --images-models")
+        a.images_server = images_server
+        a.images_models = a.images_models or str(ROOT / "models" / "images")   # where the tab's Install puts the models
         router.images = Images(ImagesConfig(server=a.images_server, models=a.images_models, card=a.images_card,
                                             port=a.images_port, cap_gib=a.images_cap_gib,
                                             ffmpeg=getattr(a, "images_ffmpeg", "") or None), router)

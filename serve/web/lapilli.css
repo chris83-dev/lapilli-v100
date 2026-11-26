@@ -834,6 +834,28 @@ div.outil__cle { margin: 0 0 6px; }
 .im-modele[aria-checked="true"] .im-modele__nom, .im-modele[aria-checked="true"] .im-modele__pas { color: var(--accent-texte); }
 .im-modele__pas { font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .im-modele__aide { font-size: 12.5px; text-wrap: pretty; }
+/* a model not installed yet: chosen to see its install, its texts softer */
+.im-modele--absent:not([aria-checked="true"]) .im-modele__nom, .im-modele--absent:not([aria-checked="true"]) .im-modele__pas,
+.im-modele--absent:not([aria-checked="true"]) .im-modele__aide { opacity: .62; }
+.im-installer { display: grid; gap: 8px; margin-top: 10px; padding: 12px 14px 14px; border: 1px solid var(--ligne);
+                border-radius: var(--r-m); background: var(--surface-2); }
+.im-installer__tete { display: flex; align-items: baseline; justify-content: space-between; gap: 2px 12px; flex-wrap: wrap; }
+.im-installer__titre { font-weight: 650; font-size: 13.5px; color: var(--encre-2); overflow-wrap: anywhere; }
+.im-installer__taille { font-size: 12.5px; color: var(--encre-douce); white-space: nowrap; font-variant-numeric: tabular-nums; }
+/* an info line breaks between its pieces, never inside one (a license's name, "87 MB/s"): pieces side by side, wrapping */
+.im-installer__infos, .im-installer__licences { display: flex; flex-wrap: wrap; row-gap: 2px; font-size: 12.5px;
+                                                color: var(--encre-douce); font-variant-numeric: tabular-nums; }
+.im-installer__infos:empty, .im-installer__licences:empty { display: none; }
+.im-installer__licences .im-installer__lib { margin-right: 6px; }
+.im-modele--absent .im-modele__aide { display: flex; flex-wrap: wrap; row-gap: 2px; }
+.im-installer__licences a { color: var(--accent-texte); }
+.im-installer__accord { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--encre-2); cursor: pointer; }
+.im-installer__accord input { margin: 0; accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
+.im-installer__note { margin: 0; font-size: 12.5px; color: var(--encre-douce); text-wrap: pretty; }
+.im-installer__note[data-ton="alerte"] { color: var(--danger-texte); }
+.im-installer__pied { display: flex; gap: 8px; flex-wrap: wrap; }
+/* the bar's empty track: a shade off the panel's own background (the same color made it invisible, seen on the captures) */
+.im-installer .barre { background: var(--surface-3); }
 /* "Same shape as the reference": a whole row under the formats, once there is a reference image */
 .im-format--ref { grid-column: 1 / -1; flex-direction: row; gap: 10px; height: 44px; }
 .im-format--ref[hidden] { display: none; }

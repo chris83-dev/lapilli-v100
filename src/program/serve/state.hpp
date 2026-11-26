@@ -165,7 +165,7 @@ public:
     void stats_lookups_end() { if (stats.on) stats.lookups_end(lookup_counts()); }
     /// Writes the XSLOT and XMAP lines when due (`force`: the slot lines now, as a request starts or ends; `with_map`: the
     /// map too, as a request ends).  (Lapilli) The map goes at most every map_every_: half a second, a second past
-    /// kMapEveryCells experts (a big map's line, ~74 KB for the Flash-Next's 24,576, cost ~0.5 % of the writing speed twice
+    /// kMapEveryCells experts (a big map's line, ~74 KB for 24,576 experts, cost ~0.5 % of the writing speed twice
     /// a second, through the pipe to the server).
     void stats_tick(bool force = false, bool with_map = false);
     ConsoleStats::Clock::time_point map_last_{};

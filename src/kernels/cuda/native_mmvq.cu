@@ -1290,7 +1290,7 @@ __global__ void native_mmvq_multi_seg_kernel(const typename F::Block* __restrict
 // the R rows. Same products and scales as Q5KTraits; the sums are grouped by lane (32 per row and column) then warp_sum,
 // so not bitwise a single-column call's: float rounding only. Off by default: with it, a row's result depends on how many
 // columns its call holds (dec_gdn_parity and q5k_head_parity check that a column is the same at every width), so a
-// drafter's verify window could change the text. DeepSeek-V4.1-Flash turns it on at load (native_mmvq_default_multi_v70):
+// drafter's verify window could change the text. One model turns it on at load (native_mmvq_default_multi_v70):
 // its text already depends on where its experts live, and the layout writes its code ~7 % faster with the drafter.
 int g_multi_v70 = [] {   // 0: off (the default); -1: the device decides (on for compute capability 7.x)
     const char* e = std::getenv("BASALT_MULTI_V70");

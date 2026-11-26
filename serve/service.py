@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy, WakeBlocked
+from serve import LAPILLI_VERSION
 from serve.engine.console import engine_facts, expert_tiers, hardware_view
 from serve.engine.mock import Engine
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
@@ -1128,6 +1129,7 @@ class Service:
         cards, l3 = engine_facts(info)
         # a start under way reads 0; the last READY's context stands in until the new one arrives
         engine = {"model": self.model, "max_context": self.engine.max_context or getattr(self.engine, "known_ctx", 0), **info,
+                  "lapilli": LAPILLI_VERSION,
                   "spill": spill, "expert_total": experts_total if isinstance(experts_total, int) else None}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}

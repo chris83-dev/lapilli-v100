@@ -1690,12 +1690,12 @@ constexpr int GRP_NC = 6;
 // (Lapilli, V100) The blocks per SM the experts' kernels at n_embd 2304 / n_ff 1152 are compiled for (their launch bounds),
 // gate/up and down: on a V100 the gate/up rows of Q8_0 take 166 registers a thread (one block an SM), NVFP4's 80 (three).
 // The bound changes the registers and the schedule only: the same arithmetic, so the same bits. Measured on a V100
-// (inkling2_kernels_parity, gate/up + SwiGLU + down, 8 experts a row, against the original bounds): NVFP4 at 1 / 4
+// (a model's kernels parity test, gate/up + SwiGLU + down, 8 experts a row, against the original bounds): NVFP4 at 1 / 4
 // rows 85.4 / 215.3 us, gate/up at 4 blocks 82.6 / 205.3, down at 2 80.9 / 204.2; Q8_0 145.4 / 351.0, gate/up at 2
 // 123.4 / 297.2, down at 1 136.9 / 334.5. The defaults by format: gate/up 4 (NVFP4) or 2 (Q8_0), down 2 or 1. BASALT_EXPERTS_MINB="g,d" sets both formats: g 1 to 4 (1: gate/up's original bounds), d 0 to 4 (0: down's
 // original bounds, none); "1,0" is the code before. native_grouped_set_minb chooses for tests.
 int g_minb_gu = 0, g_minb_down = 0;   // 0: as the environment says
-// (Lapilli, V100) gate/up at n_embd 1536 (Hy4-flash's latent) on the unrolled row, as at 2304: NVFP4 rows of 96 calls, Q8_0 of
+// (Lapilli, V100) gate/up at n_embd 1536 (a model's latent width) on the unrolled row, as at 2304: NVFP4 rows of 96 calls, Q8_0 of
 // 192, every weight load of a lane issued before its first dot (the same calls in the same order: the same bits).
 // BASALT_EXPERTS_U1536=0 keeps the generic row; native_grouped_set_unroll1536: 0 as the environment says, 1 off, 2 on (tests)
 int g_u1536 = 0;
@@ -2293,7 +2293,7 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
 
 // native_down_kernel with the entries taken GRP_NC at a time.  DEP: launched as a programmatic dependent - the
 // block's first group's weight rows are prefetched into L2 before the wait (and, for IQ4_NL, loaded into registers).
-// KC > 0 (Lapilli): a down row is KC calls (row_dot_multi's unrolled row; n_ff 1536, Hy4-flash's latent): the same bits
+// KC > 0 (Lapilli): a down row is KC calls (row_dot_multi's unrolled row; n_ff 1536, a latent width): the same bits
 template<int TD, bool DEP = false, int MINB = 1, int KC = 0>   // MINB blocks per SM at least
 __global__ void __launch_bounds__(256, MINB) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
@@ -3196,7 +3196,7 @@ int exp_lb_level() {
 
 // BASALT_GU2_MINB=1, 2, 3 or 4 (read once; Lapilli, V100): native_gu2_kernel on 5120-value rows at that many blocks
 // an SM at least. Unset (or anything else): 2 on compute capability 7.x, where the 128 registers a thread then has keep
-// more loads in flight (V100, DeepSeek-V4.1-Flash: +8 to +10 % in decode), kGu2MinBlocks' 3 elsewhere. The same
+// more loads in flight (V100, a 192-expert model: +8 to +10 % in decode), kGu2MinBlocks' 3 elsewhere. The same
 // arithmetic in the same order: only the register allocation changes.
 int gu2_minb() {
     static int v = -1;

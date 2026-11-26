@@ -284,7 +284,7 @@ public:
     program::ExpertSpill spill() const;
     /// The server's expert map: the sample's pairs of all, each one's home and its lookups since the last call (the first
     /// call starts counting them).  (Lapilli) Every expert when there are at most kMapAll of them (the Experts tab's whole
-    /// map: DeepSeek's 7,680, Inkling's 3,072), else the sample.
+    /// map: 7,680 or 3,072 experts drawn whole), else the sample.
     void expert_map(int64_t& total, std::vector<uint8_t>& homes, std::vector<uint32_t>& routed);
     static constexpr int64_t kMapAll = 8192;
     /// (Lapilli) INFO words for the page's occupancy figures: expert_cache_mib (the main card's expert slots) and

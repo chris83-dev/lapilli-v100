@@ -39,7 +39,7 @@ bool native_mmvq_multi_exact();
 // ncols == 1 to float rounding only, so with it on the multi_exact contract does not hold for Q5_K (a row's result then
 // depends on the window width): off by default. Set before graph capture.
 void native_mmvq_set_multi_v70(int rows);
-// A model's default for the same layout (-1: the device decides), kept only while BASALT_MULTI_V70 is unset: deepseek41
+// A model's default for the same layout (-1: the device decides), kept only while BASALT_MULTI_V70 is unset: one model
 // turns it on at load; the other models keep it off.
 void native_mmvq_default_multi_v70(int rows);
 

@@ -135,6 +135,21 @@
         <div class="champ">
           <span class="champ__libelle" id="lib-im-modele">Model</span>
           <div class="im-modeles" id="im-modele" role="radiogroup" aria-labelledby="lib-im-modele"></div>
+          <!-- (Lapilli) a model that is not installed yet: its files downloaded by the server, licenses accepted -->
+          <div class="im-installer" id="im-installer" hidden>
+            <div class="im-installer__tete"><span class="im-installer__titre" id="im-inst-titre"></span>
+              <span class="im-installer__taille" id="im-inst-taille"></span></div>
+            <div class="barre barre--fine" id="im-inst-barre" hidden><div class="barre__plein" id="im-inst-plein"></div></div>
+            <div class="im-installer__infos" id="im-inst-infos"></div>
+            <div class="im-installer__licences" id="im-inst-licences"></div>
+            <label class="im-installer__accord" id="im-inst-accord-ligne"><input type="checkbox" id="im-inst-accord">
+              <span>I accept these licenses</span></label>
+            <p class="im-installer__note" id="im-inst-note" hidden></p>
+            <div class="im-installer__pied">
+              <button type="button" class="btn btn--accent btn--petit" id="im-inst-go">Install</button>
+              <button type="button" class="btn btn--doux btn--petit" id="im-inst-stop" hidden>Cancel the install</button>
+            </div>
+          </div>
         </div>
         <div class="champ">
           <span class="champ__libelle" id="lib-im-format">Format <output id="o-im-format"></output></span>
@@ -461,7 +476,9 @@
           (by jesdga95, MIT license) to NVIDIA V100 (Volta) GPUs. Its interface follows the spirit of
           <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata</a>'s (by Niko1221, MIT license).
           Text is formatted by <a href="https://github.com/markedjs/marked" target="_blank" rel="noopener noreferrer">marked</a>
-          (MIT license); the font is Geist (SIL Open Font License).</p>
+          (MIT license); images and videos are made by
+          <a href="https://github.com/leejet/stable-diffusion.cpp" target="_blank" rel="noopener noreferrer">stable-diffusion.cpp</a>
+          (by leejet, MIT license); the font is Geist (SIL Open Font License).</p>
       </div>
     </div>
   </section>

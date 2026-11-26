@@ -1287,7 +1287,7 @@ basalt_gpu_test(NAME route_window_parity COMMAND route_window_parity)
 # the Volta router kernel against the previous one, bit for bit
 add_executable(route_mmvf_v2_parity tests/models/qwen4exp/kernels/route_mmvf_v2_parity.cpp)
 target_include_directories(route_mmvf_v2_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(route_mmvf_v2_parity PRIVATE model_qwen4exp_kernels ${_gpu_runtime_target})
+target_link_libraries(route_mmvf_v2_parity PRIVATE model_qwen4exp_kernels platform ${_gpu_runtime_target})
 basalt_gpu_test(NAME route_mmvf_v2_parity COMMAND route_mmvf_v2_parity)
 
 add_executable(router_top10_parity tests/models/qwen4exp/kernels/router_top10_parity.cpp)

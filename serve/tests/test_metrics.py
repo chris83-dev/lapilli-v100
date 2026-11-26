@@ -84,6 +84,10 @@ class Http(unittest.TestCase):
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
+        # (Lapilli) this release's own number beside the engine's (Basalt's): the About tab writes both
+        from serve import LAPILLI_VERSION
+        self.assertRegex(LAPILLI_VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(m["engine"]["lapilli"], LAPILLI_VERSION)
         self.assertEqual(set(m["live"]), {"state", "load", "queued", "slots", "queue", "prompt_tokens", "generated", "elapsed_s",
                                           "tok_s", "phase", "prefill_tok_s_mean"})
         self.assertEqual(m["live"]["queue"], [])

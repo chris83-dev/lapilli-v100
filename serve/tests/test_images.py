@@ -393,12 +393,26 @@ class Switch(unittest.TestCase):
                 self.images.submit(check({"prompt": "a fox", "model": "wan22-5b", "width": 1376, "height": 768}))
 
     def test_a_video_model_needs_ffmpeg(self):
-        """Without ffmpeg the page could not play sd-server's AVI: the video model is not offered."""
+        """Without ffmpeg the page could not play sd-server's AVI: the video model is not offered. The ffmpeg is the
+        one given (--images-ffmpeg), else the one the tab's Install put in the model folder, else the system's (PATH)."""
+        from serve.images_install import ffmpeg_path
         models_dir(Path(self.tmp.name), video=True)
         self.images.cfg.ffmpeg = None
-        self.assertFalse(self.images.state()["models"]["wan22-5b"]["available"])
+        with mock.patch("serve.images.shutil.which", lambda name: None):
+            self.assertFalse(self.images.state()["models"]["wan22-5b"]["available"])
+            # the one Install put in the model folder
+            p = ffmpeg_path(self.images.cfg.models)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"ffmpeg")
+            self.assertTrue(self.images.state()["models"]["wan22-5b"]["available"])
+            self.assertEqual(self.images.ffmpeg(), str(p))
+            p.unlink()
+        with mock.patch("serve.images.shutil.which", lambda name: "/usr/bin/ffmpeg"):
+            self.assertTrue(self.images.state()["models"]["wan22-5b"]["available"])     # the system's
+        # one given that is not there: nothing else is looked for
         self.images.cfg.ffmpeg = str(Path(self.tmp.name) / "absent" / "ffmpeg.exe")
-        self.assertFalse(self.images.state()["models"]["wan22-5b"]["available"])
+        with mock.patch("serve.images.shutil.which", lambda name: "/usr/bin/ffmpeg"):
+            self.assertFalse(self.images.state()["models"]["wan22-5b"]["available"])
 
     def test_edit_2511_lightning(self):
         """The same files as Edit 2511, with lightx2v's Lightning LoRA: 8 steps and guidance 1 sent, the LoRA by

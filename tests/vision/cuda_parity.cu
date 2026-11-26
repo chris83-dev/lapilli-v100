@@ -217,7 +217,7 @@ void test_layernorm() {
 
 void test_embed_rope_qkv() {
     std::printf("embed finish, rope table, qkv epilogue\n");
-    for (auto grid : {std::pair<int, int>{8, 6}, {48, 48}, {30, 40}}) {
+    for (auto grid : std::initializer_list<std::pair<int, int>>{{8, 6}, {48, 48}, {30, 40}}) {
         const int gx = grid.first, gy = grid.second, n = gx * gy;
         std::vector<float> pos = randn(48 * 48 * (size_t) E, 1.f), bias = randn(E, 1.f), x0 = randn((size_t) n * E, 1.f);
         float *dp = dev(pos), *db = dev(bias), *dx = dev(x0);

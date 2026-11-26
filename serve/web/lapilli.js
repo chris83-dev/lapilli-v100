@@ -553,7 +553,7 @@ function dessinerApropos(m) {
   const chargeA = m.live && m.live.state === "loading" && $("faits-moteur").childElementCount > 0;
   if (!chargeA) faits($("faits-moteur"), [
     ["Model", `${eng.model || sante.model}${eng.quant ? ` · ${eng.quant}` : ""}`],
-    ["Engine", `Lapilli, based on Basalt ${eng.version || eng.engine || ""}`.trim()],
+    ["Engine", `Lapilli${eng.lapilli ? ` ${eng.lapilli}` : ""}, based on Basalt ${eng.version || eng.engine || ""}`.trim()],
     ["Context", eng.max_context ? `${nf(eng.max_context)} tokens` : null],
     ["Images", sante.images ? "supported (vision on)" : "no (vision off)"],
     ["Context memory", kv ? `${kv}, ${eng.kv_resident ? `${nf(eng.kv_resident)} positions per layer on the GPUs, the rest in RAM` : "all on the GPUs"}` : null],

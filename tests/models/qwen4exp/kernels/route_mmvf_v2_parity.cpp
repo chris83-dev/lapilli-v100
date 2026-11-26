@@ -3,6 +3,7 @@
 // random values, ties (repeated logits) and tiny gaps; also the shape of the shared expert's gate (2560 -> 1).
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/models/qwen4exp/kernels/native_router.hpp"
+#include "basalt/platform/process.hpp"
 
 #include <cuda_runtime.h>
 
@@ -20,13 +21,7 @@ void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
 }
 uint16_t bf16(float f) { uint32_t i; std::memcpy(&i, &f, 4); return (uint16_t) ((i + ((i >> 16) & 1u) + 0x7FFFu) >> 16); }
-void mode(const char* name, const char* v) {
-#ifdef _WIN32
-    _putenv_s(name, v);
-#else
-    setenv(name, v, 1);
-#endif
-}
+void mode(const char* name, const char* v) { basalt::platform::set_env(name, v); }
 template <class T> std::vector<T> get(const T* d, size_t n) {
     std::vector<T> h(n);
     ck(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost), "get");

@@ -469,8 +469,8 @@ void win_gdn(Model& m, SessionState& st, const Layer& L, int gi, int T, cudaStre
     a.beta = st.rec_beta + (size_t) gi * kWindow * g.gdn_v_heads;
     if (on_wg(L.out.type)) a.y16 = (uint16_t*) b.xq;   // the out product's rows
     if (T == 1 && st.gdn_alt) a.state_out = st.gdn_alt + (size_t) gi * st.gdn_floats;   // the state after the row
-    // (Lapilli, V100) no block clusters: dec_gdn_rec's two launches write the raw output to a.o (the y rows, as qwen4exp's
-    // record_gdn does), and the session keeps no second state buffer (session.cpp: the split kernel writes no state_out)
+    // (Lapilli, V100) no block clusters: dec_gdn_rec's two launches write the raw output to a.o (the y rows, as the hybrid
+    // model's record_gdn does), and the session keeps no second state buffer (session.cpp: the split kernel writes no state_out)
     if (!kernels::dec_gdn_clusters()) a.o = b.y;
     kernels::dec_gdn_rec(a, T, s);
     prod_add(m, L.out, on_wg(L.out.type) ? b.xq : wact(m, b.y, L.out.type, g.value_width(), T, s), b.x, T, s);

@@ -586,7 +586,7 @@ uint64_t gdn_work_bytes(int64_t T) {
 
 namespace {
 // ---- The token-by-token recurrence in FP32 for V100: the kernel from before the 16-token chunks
-// (tests/models/qwen4exp/prefill/gdn_chunk_parity.cu, "the kernel before"), with q and k normalized in shared memory and
+// (gdn_chunk_parity.cu's "the kernel before"), with q and k normalized in shared memory and
 // plain loads.
 constexpr int SR_VPK = HV / HK;   // value heads per key head
 constexpr int SR_WC = 16, SR_NCB = S / SR_WC, SR_TB = 16;

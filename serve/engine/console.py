@@ -224,7 +224,7 @@ TIERS = ("main", "peer", "ram", "file")
 
 def expert_tiers(info: dict) -> dict | None:
     """The engine's expert tiers as {layers, per_layer, main_copies, pool, tiers: {main|peer|ram|file: {per_layer, experts,
-    bytes}}}: per layer (INFO expert_tiers=<name>/<per layer>/<MiB>,..., the deepseek41 engine) or in all (INFO
+    bytes}}}: per layer (INFO expert_tiers=<name>/<per layer>/<MiB>,..., an engine with a tier per layer) or in all (INFO
     expert_tiers_total=<name>/<experts>/<MiB>,..., an engine whose cards keep one pool for every layer: `pool` true and
     each per_layer None); None when the engine does not say (a dense model, another engine)."""
     words, totals = info.get("expert_tiers"), info.get("expert_tiers_total")

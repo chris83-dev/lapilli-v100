@@ -862,7 +862,7 @@ void ExpertTier::expert_map(int64_t& total, std::vector<uint8_t>& homes, std::ve
     map_.take(routed);
 }
 
-// (Lapilli) as the deepseek41 tier's before upstream moved the tier here: every tier's MiB at one_each_ (an expert of every
+// (Lapilli) as the model's own tier did before upstream moved the tier here: every tier's MiB at one_each_ (an expert of every
 // layer); with layer_weights the per-layer counts are the means
 std::string ExpertTier::occupancy_words() const {
     const auto mib = [&](int64_t per_layer) { return std::to_string(((uint64_t) std::max<int64_t>(per_layer, 0) * one_each_) >> 20); };

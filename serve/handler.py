@@ -538,6 +538,20 @@ def make_handler(target: Service | Router):
                         result = "loaded"
                     self._json(200, {"status": result, **target.v1_status()})
                     return
+                if path in ("/api/images/install", "/api/images/install/cancel"):
+                    # (Lapilli, V100) the Images tab's "Install": a model's files from the catalog (serve/images_catalog.py),
+                    # never an address; the licenses accepted in the request; from this server's page only
+                    if not self._own_page("models can be installed"):
+                        return
+                    im = getattr(router, "images", None)
+                    if im is None:
+                        self._json(404, {"error": {"message": "images are not set up on this server (--images-server)"}})
+                        return
+                    if path == "/api/images/install":
+                        self._json(202, im.install(str(req.get("model") or ""), req.get("accept")))
+                    else:
+                        self._json(200, im.install_cancel() or {})
+                    return
                 if path == "/api/images/jobs" or (path.startswith("/api/images/jobs/") and path.endswith("/cancel")):
                     # (Lapilli, V100) the Images tab: a job (it takes the cards from the chat), or its cancel
                     if not self._own_page("images can be made"):

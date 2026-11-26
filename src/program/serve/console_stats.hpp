@@ -13,7 +13,7 @@
 // The expert counts are those of DONE: `lookups` the main card or the CPU served, `hits` the main card's share of
 // them, `offloaded` what a bus copy or another card served, `files` the lookups read from the pack file.  A window
 // several slots share (a batch round) counts its lookups for each of them.
-// (Lapilli) map_line writes its line in place (the same bytes, ~2x faster for the Flash-Next's 24,576 counts).
+// (Lapilli) map_line writes its line in place (the same bytes, ~2x faster for a map of 24,576 counts).
 #pragma once
 
 #include <charconv>
@@ -115,8 +115,8 @@ public:
     }
     const SlotTally* slot(int b) const { return b >= 0 && (size_t) b < tally_.size() ? &tally_[(size_t) b] : nullptr; }
 
-    // (Lapilli) written in place, without a temporary string per count: the same bytes, ~2x faster (24,576 counts for the
-    // Flash-Next)
+    // (Lapilli) written in place, without a temporary string per count: the same bytes, ~2x faster (a map of 24,576
+    // counts)
     static std::string map_line(int64_t total, const std::vector<uint8_t>& homes, const std::vector<uint32_t>& routed) {
         std::string s;
         s.resize(32 + homes.size() + routed.size() * 11);

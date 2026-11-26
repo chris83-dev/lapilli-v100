@@ -203,8 +203,9 @@ People tested Lapilli on their own machines and shared everything. Their figures
 | **[nebod99](docs/community/one-v100-pcie-linux.md)** | 1 × V100 PCIe 32 GB, Linux (CUDA 12.6.3 in Docker), i9-10940X, 96 GB | v0.4, Qwen3.8-Flash-Next `IQ3_S`, a 7,242-token prompt, thinking on | **100.9 tokens/s** at 128K context (Strata: 55.6), first token **8.7 s** (22.6); on 2,500+ questions, the same quality as Strata |
 | **[ildargiv](docs/community/v100-16gb-linux.md)** | 1 × V100-SXM2 **16 GB**, Ubuntu 22.04, Ryzen 5 5600G, 96 GB | v0.4, Qwen3.8-Flash-Next `IQ3_XXS`, the first 16 GB card | **67.8 / 76.0 / 70.4 tokens/s** writing after 1K / 8K / 32K prompts; prompt reading 497 / 1,033 / 1,174 tokens/s; a stable 16 GB setup |
 | **[Csavoldi](docs/community/inkling2-mini.md)** | 2 × V100 PCIe 32 GB, one in use | **Inkling 2 Mini** ported onto Lapilli: upstream Basalt v0.5.5 merged with the Volta paths | **69 tokens/s** writing (60.5 at 42K, 44.4 at 165K); prompt 850 tokens/s; 512K context; 5/5 top-1 against llama.cpp |
+| **[nkhaooat](docs/community/two-v100-pcie-linux.md)** | 2 × V100 PCIe 32 GB (one on SXM2 VBIOS), Gen3 x8 with peer access, Linux, Ryzen 9 7945HX3D, 96 GB | v0.5, Qwen3.8-Flash-Next `UD-Q4_K_XL` + Q8 n-gram, a frozen 966-trial suite against Strata and sFNX on the same payload | **146.2 / 117.6 tokens/s** edit/code decode (sFNX: 107.7 / 101.3, Strata: 59.5 / 77.1); quality within 6 passes of both engines |
 
-Thank you, nebod99, ildargiv and Csavoldi. Lapilli had only ever run on one machine; you took it to Linux, to a single card,
+Thank you, nebod99, ildargiv, Csavoldi and nkhaooat. Lapilli had only ever run on one machine; you took it to Linux, to a single card,
 to a 16 GB V100 and to a new model, measured carefully and wrote down what others need to do the same. Every V100 owner
 benefits from your work.
 

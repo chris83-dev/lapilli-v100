@@ -424,7 +424,8 @@ def main() -> int:
         if not a.images_models:
             raise SystemExit("--images-server needs --images-models")
         router.images = Images(ImagesConfig(server=a.images_server, models=a.images_models, card=a.images_card,
-                                            port=a.images_port, cap_gib=a.images_cap_gib), router)
+                                            port=a.images_port, cap_gib=a.images_cap_gib,
+                                            ffmpeg=getattr(a, "images_ffmpeg", "") or None), router)
         for s in services:
             s.release_gpu = router.images.release_gpu
         print(tagged("images", f"{a.images_server} on card {a.images_card}, models {a.images_models}"), flush=True)

@@ -120,7 +120,7 @@
   <section class="vue vue--defile" id="vue-images" role="tabpanel" aria-labelledby="onglet-images" hidden>
     <div class="imagier">
       <form class="carte im-creer" id="im-form" autocomplete="off" novalidate>
-        <div class="carte__tete"><span class="carte__titre">Create an image</span><span class="doux petit im-moteur" id="im-moteur-note"></span></div>
+        <div class="carte__tete"><span class="carte__titre" id="im-titre">Create an image</span><span class="doux petit im-moteur" id="im-moteur-note"></span></div>
         <div class="champ">
           <label class="champ__libelle" for="im-prompt">Prompt <output id="o-im-prompt"></output></label>
           <textarea class="entree entree--zone im-prompt" id="im-prompt" rows="5" maxlength="4000"
@@ -153,10 +153,16 @@
             <input class="entree" id="im-hauteur" type="number" min="256" max="2816" step="32" inputmode="numeric"></div>
           <span class="doux petit im-libre__note" id="im-libre-note"></span>
         </div>
+        <div class="champ" id="im-duree-champ" hidden>
+          <span class="champ__libelle" id="lib-im-duree">Duration <output id="o-im-duree"></output></span>
+          <div class="segments" id="im-duree" role="radiogroup" aria-labelledby="lib-im-duree">
+            <button type="button" role="radio" data-v="1">1 s</button><button type="button" role="radio" data-v="2">2 s</button><button type="button" role="radio" data-v="3">3 s</button><button type="button" role="radio" data-v="5">5 s</button>
+          </div>
+        </div>
         <details class="avance" id="im-avance">
           <summary><span>Advanced settings</span><svg class="ic ic--p chevron"><use href="web/lapilli-icons.svg#i-chevron"/></svg></summary>
           <div class="avance__corps">
-            <div class="champ">
+            <div class="champ" id="im-nombre-champ">
               <span class="champ__libelle" id="lib-im-nombre">Number of images <output id="o-im-nombre"></output></span>
               <div class="segments" id="im-nombre" role="radiogroup" aria-labelledby="lib-im-nombre">
                 <button type="button" role="radio" data-v="1">1</button><button type="button" role="radio" data-v="2">2</button><button type="button" role="radio" data-v="3">3</button><button type="button" role="radio" data-v="4">4</button>
@@ -571,6 +577,7 @@
     <button class="im-visionneuse__fleche im-visionneuse__fleche--g" id="iv-avant" type="button" title="Previous image" aria-label="Previous image">
       <svg class="ic"><use href="web/lapilli-icons.svg#i-chevron"/></svg></button>
     <img class="im-visionneuse__img" id="iv-img" alt="">
+    <video class="im-visionneuse__img im-visionneuse__video" id="iv-video" controls loop playsinline preload="auto" hidden></video>
     <button class="im-visionneuse__fleche im-visionneuse__fleche--d" id="iv-apres" type="button" title="Next image" aria-label="Next image">
       <svg class="ic"><use href="web/lapilli-icons.svg#i-chevron"/></svg></button>
   </div>

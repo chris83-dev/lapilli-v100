@@ -132,7 +132,10 @@ select.entree { cursor: pointer; }
             border: 1px solid var(--ligne-douce); }
 .segments button { height: 34px; border: 0; border-radius: 9px; background: transparent; color: var(--encre-douce); font: 600 13px/1 var(--police); cursor: pointer; }
 .segments button:hover { color: var(--encre); }
-.segments button[aria-checked="true"] { background: var(--surface); color: var(--encre); box-shadow: var(--ombre-carte); }
+/* (HIS remark: "the selection of the buttons and cards can hardly be told apart, they have the same color") a choice
+   that is checked shows it: an accent ring inside it, an accent tint and accent text (4.6 to 1 against its track in the light
+   theme, 5.9 in the dark one; WCAG 1.4.11 asks 3 for a control's state). The white raised choice of before: 1.1 to 1 */
+.segments button[aria-checked="true"] { background: var(--accent-teinte); color: var(--accent-texte); box-shadow: inset 0 0 0 1.5px var(--accent); }
 
 /* ------------------------------------------------------------------ header */
 .entete { display: flex; align-items: center; gap: 12px; height: 60px; flex: none; padding: 0 16px 0 12px; background: var(--surface);
@@ -815,20 +818,20 @@ div.outil__cle { margin: 0 0 6px; }
              border: 0; border-radius: 9px; background: transparent; color: var(--encre-douce); font: 600 12.5px/1 var(--police); cursor: pointer;
              font-variant-numeric: tabular-nums; white-space: nowrap; }
 .im-format:hover { color: var(--encre); }
-.im-format[aria-checked="true"] { background: var(--surface); color: var(--encre); box-shadow: var(--ombre-carte); }
+.im-format[aria-checked="true"] { background: var(--accent-teinte); color: var(--accent-texte); box-shadow: inset 0 0 0 1.5px var(--accent); }
 .im-format__forme { display: block; flex: none; border: 1.8px solid currentColor; border-radius: 3px; }
 .im-format[data-v="libre"] .im-format__forme { border-style: dashed; }
-/* the models: one line each (its name, its steps, what it does), the chosen one raised like a segment */
+/* the models: one line each (its name, its steps, what it does), the chosen one marked like a segment */
 .im-modeles { display: flex; flex-direction: column; gap: 4px; padding: 4px; border-radius: var(--r-m); background: var(--surface-2);
               border: 1px solid var(--ligne-douce); }
 .im-modele { display: flex; flex-direction: column; align-items: stretch; gap: 3px; padding: 9px 12px 10px; border: 0; border-radius: 9px;
              background: transparent; color: var(--encre-douce); font: 400 13px/1.4 var(--police); text-align: left; cursor: pointer; }
 .im-modele:hover:not(:disabled) { color: var(--encre-2); }
-.im-modele[aria-checked="true"] { background: var(--surface); color: var(--encre-2); box-shadow: var(--ombre-carte); }
+.im-modele[aria-checked="true"] { background: var(--accent-teinte); color: var(--encre-2); box-shadow: inset 0 0 0 1.5px var(--accent); }
 .im-modele:disabled { opacity: .5; cursor: not-allowed; }
 .im-modele__tete { display: flex; align-items: baseline; justify-content: space-between; gap: 4px 12px; flex-wrap: wrap; }
 .im-modele__nom { font-weight: 650; font-size: 13.5px; color: var(--encre-2); }
-.im-modele[aria-checked="true"] .im-modele__nom { color: var(--encre); }
+.im-modele[aria-checked="true"] .im-modele__nom, .im-modele[aria-checked="true"] .im-modele__pas { color: var(--accent-texte); }
 .im-modele__pas { font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .im-modele__aide { font-size: 12.5px; text-wrap: pretty; }
 /* "Same shape as the reference": a whole row under the formats, once there is a reference image */
@@ -861,6 +864,9 @@ div.outil__cle { margin: 0 0 6px; }
             border-radius: var(--r-g); overflow: hidden; background: var(--surface-2); border: 1px solid var(--ligne-douce); }
 .im-cadre--image { cursor: zoom-in; background: var(--surface-3); }
 .im-cadre--image img { display: block; width: 100%; height: 100%; object-fit: contain; }
+/* a video: on black, as wide as its frame, its controls on it */
+.im-cadre--video { background: #000; border-color: transparent; }
+.im-cadre--video video { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
 .im-cadre--failed { background: var(--danger-teinte); border-color: transparent; }
 .im-cadre--cancelled { background: var(--surface-2); }
 .im-cadre--vide { border: 1.5px dashed var(--ligne); background: transparent; }
@@ -906,6 +912,11 @@ div.outil__cle { margin: 0 0 6px; }
                background: var(--surface-2); cursor: zoom-in; }
 .im-vignette img { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform 240ms var(--courbe); }
 .im-vignette:hover img { transform: scale(1.04); }
+.im-vignette--video { position: relative; }
+.im-vignette__badge { position: absolute; left: 7px; bottom: 7px; display: inline-flex; align-items: center; gap: 3px; padding: 3px 8px 3px 6px;
+                      border-radius: 999px; background: rgba(12, 10, 9, .72); color: #fff; font: 600 12px/1.2 var(--police);
+                      font-variant-numeric: tabular-nums; white-space: nowrap; pointer-events: none; }
+.im-vignette__badge .ic { width: 12px; height: 12px; }
 /* the viewer: dark at every theme, like the chat's */
 .im-visionneuse { position: fixed; inset: 0; z-index: 80; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; background: #0c0a09;
                   color: #f3f0ea; }
@@ -919,6 +930,8 @@ div.outil__cle { margin: 0 0 6px; }
 .im-visionneuse .btn--icone:hover:not(:disabled) { background: rgba(255, 255, 255, .12); color: #fff; }
 .im-visionneuse__scene { position: relative; display: flex; align-items: center; justify-content: center; min-height: 0; padding: 0 72px; }
 .im-visionneuse__img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; border-radius: var(--r-p); box-shadow: 0 18px 50px rgba(0, 0, 0, .6); }
+.im-visionneuse__img[hidden] { display: none; }
+.im-visionneuse__video { background: #000; }
 .im-visionneuse__fleche { position: absolute; top: 50%; translate: 0 -50%; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center;
                           border: 0; border-radius: 50%; background: rgba(255, 255, 255, .1); color: #f3f0ea; cursor: pointer; }
 .im-visionneuse__fleche:hover:not(:disabled) { background: rgba(255, 255, 255, .2); }

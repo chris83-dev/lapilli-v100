@@ -10,6 +10,7 @@ import http.client
 import json
 import socket
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
@@ -52,11 +53,21 @@ EDIT_2511 = ("diffusion_models/qwen-image-edit-2511-Q8_0.gguf", "text_encoders/Q
              "text_encoders/Qwen2.5-VL-7B-Instruct.mmproj-f16.gguf", "vae/qwen_image_vae.safetensors")
 
 
-def models_dir(root: Path, vision: bool = True, edit: bool = False) -> Path:
+WAN22 = ("diffusion_models/Wan2.2-TI2V-5B-Q8_0.gguf", "text_encoders/umt5-xxl-encoder-Q8_0.gguf", "vae/wan2.2_vae.safetensors")
+# LTX-2.3 Distilled: the 1.0 model sits beside the 1.1 (the catalog takes the 1.1), Gemma 3 12B and its mmproj beside it
+LTX23 = ("diffusion_models/ltx-2.3-22b-distilled-Q8_0.gguf", "diffusion_models/ltx-2.3-22b-distilled-1.1-Q8_0.gguf",
+         "text_encoders/gemma-3-12b-it-Q8_0.gguf", "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+         "vae/ltx-2.3-22b-distilled_video_vae.safetensors", "vae/ltx-2.3-22b-distilled_audio_vae.safetensors")
+# ffmpeg for the video tests: LAPILLI_TEST_FFMPEG, or the one on the PATH
+FFMPEG = os.environ.get("LAPILLI_TEST_FFMPEG") or __import__("shutil").which("ffmpeg")
+
+
+def models_dir(root: Path, vision: bool = True, edit: bool = False, video: bool = False, ltx: bool = False) -> Path:
     m = root / "modeles"
     for rel in ("diffusion_models/qwen_image_2.1-Q8_0.gguf", "diffusion_models/qwen_image_2.1_turbo-Q8_0.gguf",
                 "text_encoders/Qwen3VL-8B-Instruct-Q8_0.gguf", "vae/qwen_image_2.1_vae_bf16.safetensors") + \
-            (("text_encoders/mmproj-Qwen3VL-8B-Instruct-F16.gguf",) if vision else ()) + (EDIT_2511 if edit else ()):
+            (("text_encoders/mmproj-Qwen3VL-8B-Instruct-F16.gguf",) if vision else ()) + (EDIT_2511 if edit else ()) + \
+            (WAN22 if video else ()) + (LTX23 if ltx else ()):
         (m / rel).parent.mkdir(parents=True, exist_ok=True)
         (m / rel).write_bytes(b"x")
     return m
@@ -115,7 +126,7 @@ class Switch(unittest.TestCase):
         # the base interpreter: a venv's python.exe on Windows only LAUNCHES it, as a child (its reads would not be the
         # process's own, as sd-server.exe's are)
         self.images = Images(ImagesConfig(server=[getattr(sys, "_base_executable", sys.executable), str(FAKE)], models=str(self.models), card=1,
-                                          port=free_port(), log=str(root / "sd.log")), self.router)
+                                          port=free_port(), log=str(root / "sd.log"), ffmpeg=FFMPEG), self.router)
         self.svc.release_gpu = self.images.release_gpu
 
     def tearDown(self):
@@ -195,7 +206,7 @@ class Switch(unittest.TestCase):
                                           "llm_vision": "text_encoders/Qwen2.5-VL-7B-Instruct.mmproj-f16.gguf",
                                           "vae": "vae/qwen_image_vae.safetensors"})
         st = self.images.state()["models"]
-        self.assertEqual(list(st), ["turbo", "base", "edit-2511-lightning", "edit-2511"])   # the page's order
+        self.assertEqual(list(st), ["turbo", "base", "edit-2511-lightning", "edit-2511", "wan22-5b", "ltx23"])   # the page's order
         self.assertFalse(st["edit-2511-lightning"]["available"])           # its LoRA is not in loras/ here
         self.assertEqual((st["edit-2511"]["refs"], st["edit-2511"]["steps"], st["edit-2511"]["cfg"], st["turbo"]["fixed"]),
                          ("required", 20, 4.0, True))
@@ -278,6 +289,117 @@ class Switch(unittest.TestCase):
         self.assertLessEqual(max(rb for _, rb, _ in seen[0]), size)
         self.assertEqual(seen[1], [])
 
+    @unittest.skipUnless(FFMPEG, "ffmpeg is needed for the video tests (LAPILLI_TEST_FFMPEG)")
+    def test_a_video_job(self):
+        """Wan 2.2 TI2V-5B: sd-server's vid_gen with its frames, 24 frames a second, the start image as init_image,
+        the AVI it gives (MJPEG) made MP4 by ffmpeg, the job telling its frames and frame rate."""
+        models_dir(Path(self.tmp.name), video=True)
+        st = self.images.state()["models"]["wan22-5b"]
+        self.assertEqual((st["available"], st["kind"], st["fps"], st["frames_max"], st["frames_step"], st["refs_max"]),
+                         (True, "video", 24, 121, 4, 1))
+        debut = png_url(832, 480)
+        job = self.run_job(model="wan22-5b", width=832, height=480, frames=33, refs=[debut])
+        self.assertEqual(job.state, "completed", job.error)
+        body = [n["vid_gen"] for n in self.notes() if "vid_gen" in n][-1]
+        self.assertEqual((body["model"]["recipe"], body["video_frames"], body["fps"], body["output_format"], body["init_image"]),
+                         ("wan22-ti2v-5b", 33, 24, "avi", debut))
+        self.assertNotIn("ref_images", body)
+        self.assertNotIn("batch_count", body)
+        self.assertEqual(body["sample_params"], {"sample_steps": 20, "guidance": {"txt_cfg": 5.0}})
+        self.assertTrue(body["negative_prompt"].startswith("色调艳丽，过曝，静态"))   # Wan's own, none being given
+        self.assertEqual(len(body["negative_prompt"]), 137)
+        self.assertEqual(job.video[4:8], b"ftyp")                       # an MP4
+        self.assertEqual(job.poster[:3], b"\xff\xd8\xff")                 # its first frame, a JPEG
+        # H.264 in the standard range (the MJPEG frames are full range: many players show that washed out)
+        probe = Path(FFMPEG).with_name("ffprobe" + Path(FFMPEG).suffix)
+        if probe.is_file():
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / "v.mp4").write_bytes(job.video)
+                out = subprocess.run([str(probe), "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                      "stream=codec_name,pix_fmt,color_range", "-of", "compact=p=0", str(Path(d) / "v.mp4")],
+                                     capture_output=True, text=True, timeout=60).stdout.strip()
+            self.assertEqual(out, "codec_name=h264|pix_fmt=yuv420p|color_range=tv")
+        v = job.view(with_images=False)
+        self.assertEqual((v["kind"], v["video"]["frames"], v["video"]["fps"], v["video"]["mime"], v["video"]["bytes"],
+                          v["video"]["poster"]), ("video", 5, 24, "video/mp4", len(job.video), len(job.poster)))
+        self.assertEqual(job.images, [])
+        self.assertEqual((st["negative_default"], st["decode_us_per_px"]), (True, 2.2))
+        # a negative prompt given is sent as it is
+        job = self.run_job(model="wan22-5b", width=832, height=480, frames=9, negative_prompt="blurry, static")
+        self.assertEqual(job.state, "completed", job.error)
+        body = [n["vid_gen"] for n in self.notes() if "vid_gen" in n][-1]
+        self.assertEqual((body["negative_prompt"], body["video_frames"]), ("blurry, static", 9))
+        self.assertNotIn("init_image", body)
+        # an image model has no default negative prompt
+        self.assertFalse(self.images.state()["models"]["turbo"]["negative_default"])
+        # the pill's "Video model loaded": the kind of the last model the image server ran, none once it stops
+        self.assertEqual(self.images.summary()["loaded"], "video")
+        self.assertEqual(self.run_job().state, "completed")             # a Turbo image after it
+        self.assertEqual(self.images.summary()["loaded"], "image")
+        self.images.release_gpu()
+        self.assertIsNone(self.images.summary()["loaded"])
+
+    @unittest.skipUnless(FFMPEG, "ffmpeg is needed for the video tests (LAPILLI_TEST_FFMPEG)")
+    def test_an_ltx_video_with_its_sound(self):
+        """LTX-2.3 Distilled 1.1: sd-server's recipe ltx23-distilled with its five files (the 1.1 model, not the 1.0
+        beside it; Gemma, not its mmproj), no steps nor guidance sent (the recipe's 8 and 1), 24 frames a second; its AVI's sound
+        kept in the MP4 (AAC) and told by the job."""
+        root = Path(self.tmp.name)
+        models_dir(root, video=True, ltx=True)
+        (root / "modeles" / "text_encoders" / "gemma-3-12b-it-mmproj-F16.gguf").write_bytes(b"x")
+        st = self.images.state()["models"]["ltx23"]
+        self.assertEqual((st["available"], st["kind"], st["fps"], st["frames_step"], st["fixed"], st["audio"], st["decode_us_per_px"]),
+                         (True, "video", 24, 8, True, True, 0.32))
+        self.assertEqual(list(self.images.state()["models"])[-2:], ["wan22-5b", "ltx23"])
+        job = self.run_job(model="ltx23", width=768, height=512, frames=121)
+        self.assertEqual(job.state, "completed", job.error)
+        body = [n["vid_gen"] for n in self.notes() if "vid_gen" in n][-1]
+        self.assertEqual((body["model"]["recipe"], body["video_frames"], body["fps"]), ("ltx23-distilled", 121, 24))
+        self.assertEqual(body["model"]["models"], {
+            "diffusion_model": "diffusion_models/ltx-2.3-22b-distilled-1.1-Q8_0.gguf", "llm": "text_encoders/gemma-3-12b-it-Q8_0.gguf",
+            "embeddings_connectors": "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors.safetensors",
+            "vae": "vae/ltx-2.3-22b-distilled_video_vae.safetensors", "audio_vae": "vae/ltx-2.3-22b-distilled_audio_vae.safetensors"})
+        self.assertNotIn("sample_params", body)                 # the recipe's own 8 steps, guidance 1
+        self.assertNotIn("negative_prompt", body)               # no default (guidance 1 makes no negative pass)
+        self.assertEqual(job.view(with_images=False)["video"]["audio"], True)
+        probe = Path(FFMPEG).with_name("ffprobe" + Path(FFMPEG).suffix)
+        if probe.is_file():
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / "v.mp4").write_bytes(job.video)
+                out = subprocess.run([str(probe), "-v", "error", "-show_entries", "stream=codec_type,codec_name", "-of", "compact=p=0",
+                                      str(Path(d) / "v.mp4")], capture_output=True, text=True, timeout=60).stdout.split()
+            self.assertEqual(sorted(out), ["codec_name=aac|codec_type=audio", "codec_name=h264|codec_type=video"])
+        # Wan 2.2's video has no sound, and says so
+        job = self.run_job(model="wan22-5b", width=832, height=480, frames=9)
+        self.assertEqual((job.state, job.view(with_images=False)["video"]["audio"]), ("completed", False))
+        # its frames go by 8
+        with self.assertRaisesRegex(ImagesError, r"^frames: from 9 to 121, one more than a multiple of 8"):
+            check({"prompt": "a storm", "model": "ltx23", "frames": 33 + 4})
+        self.assertEqual(check({"prompt": "a storm", "model": "ltx23", "frames": 49})["frames"], 49)
+
+    def test_the_video_checks(self):
+        """A video: 1 + 4k frames up to 121, one at a time, one start image at most, 1280×704 at most."""
+        for req, motif in (({"frames": 34}, r"^frames: from 5 to 121, one more than a multiple of 4"),
+                           ({"frames": 125}, r"^frames: from 5 to 121"), ({"frames": True}, r"^frames"),
+                           ({"count": 2}, r"^count: a video is made one at a time"),
+                           ({"refs": [REF, REF]}, r"^refs: one start image at most")):
+            with self.subTest(req=str(req)[:40]):
+                with self.assertRaisesRegex(ImagesError, motif):
+                    check({"prompt": "a fox", "model": "wan22-5b", **req})
+        self.assertEqual(check({"prompt": "a fox", "model": "wan22-5b"})["frames"], 49)     # 2 s at 24 frames a second
+        models_dir(Path(self.tmp.name), video=True)
+        if FFMPEG:
+            with self.assertRaisesRegex(ImagesError, "^size: the Wan 2.2 Video model makes videos of 0.9 megapixels at most"):
+                self.images.submit(check({"prompt": "a fox", "model": "wan22-5b", "width": 1376, "height": 768}))
+
+    def test_a_video_model_needs_ffmpeg(self):
+        """Without ffmpeg the page could not play sd-server's AVI: the video model is not offered."""
+        models_dir(Path(self.tmp.name), video=True)
+        self.images.cfg.ffmpeg = None
+        self.assertFalse(self.images.state()["models"]["wan22-5b"]["available"])
+        self.images.cfg.ffmpeg = str(Path(self.tmp.name) / "absent" / "ffmpeg.exe")
+        self.assertFalse(self.images.state()["models"]["wan22-5b"]["available"])
+
     def test_edit_2511_lightning(self):
         """The same files as Edit 2511, with lightx2v's Lightning LoRA: 8 steps and guidance 1 sent, the LoRA by
         sd-server's own id; offered only with its LoRA file."""
@@ -330,6 +452,34 @@ class Routes(Switch):
         finally:
             c.close()
 
+    @unittest.skipUnless(FFMPEG, "ffmpeg is needed for the video tests (LAPILLI_TEST_FFMPEG)")
+    def test_the_video_route(self):
+        """GET /api/images/jobs/{id}/video: the MP4 itself (video/mp4, its length), 404 for a job without one."""
+        models_dir(Path(self.tmp.name), video=True)
+        code, j = self.call("POST", "/api/images/jobs", {"prompt": "a fox", "model": "wan22-5b", "width": 832, "height": 480, "frames": 9})
+        self.assertEqual(code, 202, j)
+        job = self.images.get(j["id"])
+        self.assertTrue(self.images.wait(job, 60))
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+        try:
+            c.request("GET", f"/api/images/jobs/{j['id']}/video")
+            r = c.getresponse()
+            data = r.read()
+            self.assertEqual((r.status, r.getheader("Content-Type"), int(r.getheader("Content-Length"))), (200, "video/mp4", len(data)))
+            self.assertEqual(data, job.video)
+            c.request("GET", f"/api/images/jobs/{j['id']}/poster")
+            r = c.getresponse()
+            data = r.read()
+            self.assertEqual((r.status, r.getheader("Content-Type"), data), (200, "image/jpeg", job.poster))
+        finally:
+            c.close()
+        code, st = self.call("GET", f"/api/images/jobs/{j['id']}?images=0")
+        self.assertEqual((code, st["kind"], st["video"]["mime"]), (200, "video/mp4"[:0] or "video", "video/mp4"))
+        code, err = self.call("GET", "/api/images/jobs/img-0-0/video")
+        self.assertEqual((code, err["error"]["message"]), (404, "no video for this job"))
+        code, err = self.call("GET", "/api/images/jobs/img-0-0/poster")
+        self.assertEqual((code, err["error"]["message"]), (404, "no poster for this job"))
+
     def test_the_page_routes(self):
         code, st = self.call("GET", "/api/images")
         self.assertEqual((code, st["configured"], st["models"]["turbo"]["available"], st["models"]["base"]["steps"]), (200, True, True, 40))
@@ -366,7 +516,7 @@ class Routes(Switch):
 
     def test_metrics_tell_what_the_cards_make(self):
         code, m = self.call("GET", "/metrics")
-        self.assertEqual((code, m["images"]), (200, {"server": "stopped", "job": None, "queued": 0}))
+        self.assertEqual((code, m["images"]), (200, {"server": "stopped", "job": None, "queued": 0, "loaded": None}))
         job = self.images.submit(check({"prompt": "a fox"}))
         seen, deadline = None, time.time() + 30
         while seen is None and time.time() < deadline:
@@ -376,11 +526,12 @@ class Routes(Switch):
                 seen = j
             time.sleep(0.05)
         self.assertIsNotNone(seen, "no generating job seen in /metrics")
-        self.assertEqual((seen["id"], seen["model"], seen["width"], seen["count"], seen["source"]), (job.id, "turbo", 1024, 1, "page"))
+        self.assertEqual((seen["id"], seen["model"], seen["width"], seen["count"], seen["source"], seen["kind"]),
+                         (job.id, "turbo", 1024, 1, "page", "image"))
         self.assertNotIn("preview", seen)                   # /metrics stays small: no preview, no image
         self.assertTrue(self.images.wait(job, 60))
         code, m = self.call("GET", "/metrics")
-        self.assertEqual((m["images"]["server"], m["images"]["job"]), ("ready", None))
+        self.assertEqual((m["images"]["server"], m["images"]["job"], m["images"]["loaded"]), ("ready", None, "image"))
         code, v = self.call("GET", f"/api/images/jobs/{job.id}?images=0")
         self.assertLess(abs(v["now"] - time.time()), 5)    # the server's clock, for the page's timings
 

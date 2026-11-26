@@ -512,7 +512,8 @@ function dessinerPastille(m) {
     lecture: `Reading${lu != null ? ` · ${nf(lu * 100)}%` : ""}`,
     reflexion: `Thinking${live.tok_s ? ` · ${nf(live.tok_s, 1)} tokens/s` : ""}`,
     ecriture: `Writing${live.tok_s ? ` · ${nf(live.tok_s, 1)} tokens/s` : ""}`,
-    attente: live.state === "unloaded" ? (m.images && m.images.server === "ready" ? "Image model loaded" : "Model unloaded")
+    attente: live.state === "unloaded" ? (m.images && m.images.server === "ready"
+      ? (m.images.loaded === "video" ? "Video model loaded" : "Image model loaded") : "Model unloaded")
       : live.state === "asleep" ? "Asleep" : `Waiting · ${nf(live.queued)}`,
     repos: "Idle",
   };

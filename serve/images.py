@@ -20,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -66,6 +67,45 @@ MODELS = {
                   "refs_area_max": 768 * 768, "area_max": 1024 * 1024, "refs": "required",
                   "description": "Edits your images and keeps faces, objects and text as they are.", "files": EDIT_2511},
 }
+# (Lapilli) VIDEO: Wan 2.2 TI2V-5B (Apache 2.0), a prompt or a start image to a video, with its recipe's own
+# settings (euler, guidance 5, flow shift 5, 20 steps); 24 frames a second, the model's (sd-cli writes 16 by default); 1 + 4k
+# frames, 121 at most (5 s). Measured on a V100 (sd-cli, 33 frames): 832×480 66 s, 1280×704 161 s, 704×704 from an
+# image 85 s. sd-server writes AVI (MJPEG; built without WebM): ffmpeg (--images-ffmpeg) makes the MP4 the page plays; without
+# ffmpeg a video model is not offered.
+WAN22_5B = {"diffusion_model": "diffusion_models/Wan2.2-TI2V-5B*.gguf", "t5xxl": "text_encoders/umt5-xxl*.gguf",
+            "vae": "vae/wan2.2_vae*.safetensors"}
+MODELS["wan22-5b"] = {"kind": "video", "recipe": "wan22-ti2v-5b", "label": "Wan 2.2 Video", "steps": 20, "cfg": 5.0,
+                      "fixed": False, "fps": 24, "frames_max": 121, "frames_step": 4, "area_max": 1280 * 704,
+                      "refs": "optional", "refs_max": 1, "required": ("diffusion_model", "t5xxl", "vae"),
+                      "description": "Makes videos of up to 5 seconds from a prompt, or brings a start image to life.",
+                      "files": WAN22_5B,
+                      # the negative prompt of stable-diffusion.cpp's own Wan 2.2 TI2V-5B examples (docs/dgl/wan, text and
+                      # image to video: Wan's default), sent when the request gives none
+                      "negative_default": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，"
+                                          "低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，"
+                                          "毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+                      # the VAE decoding of the frames, measured on a V100 (five videos from 33 frames at 832×480 to
+                      # 121 at 1280×704): 2.1 to 2.2 µs a pixel of each frame, 108 s for 5 s at 832×480, 236 s at 1280×704;
+                      # sd-server gives no progress for it: the page tells the time left from this
+                      "decode_us_per_px": 2.2}
+# (Lapilli) VIDEO WITH SOUND: LTX-2.3 Distilled 1.1 (Lightricks, "LTX-2 Community License":
+# worldwide and free, paid only above 10 M$ of yearly revenue): 22 B parameters drawing the frames and the sound together,
+# sd-server's recipe ltx23-distilled (euler, guidance 1, 8 steps, 24 frames a second, 1 + 8k frames), Gemma 3 12B reading
+# the prompt. Measured on a V100 with sd-cli (5 s, 121 frames): 768×512 in 73 s (steps 41 s, frames decoded in 15 s, sound
+# in 4 s), from a start image at 640×640 in 93 s, 1280×704 in 165 s; the sound: stereo 48 kHz. unsloth's GGUF publishes the
+# connectors and decoders of "distilled" only: they suit 1.1 (its output drawn right, the same frames-to-frames evenness).
+LTX23 = {"diffusion_model": "diffusion_models/ltx-2.3-22b-distilled-1.1*.gguf", "llm": "text_encoders/gemma-3-12b-it*.gguf",
+         "embeddings_connectors": "text_encoders/ltx-2.3-22b-distilled_embeddings_connectors*.safetensors",
+         "vae": "vae/ltx-2.3-22b-distilled_video_vae*.safetensors", "audio_vae": "vae/ltx-2.3-22b-distilled_audio_vae*.safetensors"}
+MODELS["ltx23"] = {"kind": "video", "recipe": "ltx23-distilled", "label": "LTX-2.3 Video", "steps": 8, "cfg": 1.0,
+                   "fixed": True, "send": False, "fps": 24, "frames_max": 121, "frames_step": 8, "area_max": 1280 * 704,
+                   "refs": "optional", "refs_max": 1, "audio": True,
+                   "required": ("diffusion_model", "llm", "embeddings_connectors", "vae", "audio_vae"),
+                   "description": "Makes videos with their sound, up to 5 seconds, from a prompt or a start image.",
+                   "files": LTX23,
+                   # its decoding, measured (three videos of 121 frames, 640×640 to 1280×704): 0.31 to 0.33 µs a pixel of each
+                   # frame, and the sound 4.1 s for 121 frames
+                   "decode_us_per_px": 0.32, "decode_audio_s_per_frame": 0.034}
 REQUIRED_SLOTS = ("diffusion_model", "llm", "vae")
 READ_SHOWN = 256 << 20           # model files read for a job beyond this: its "preparing" says it reads them, and how far
 SIDE_MIN, SIDE_MAX, AREA_MAX, MULTIPLE = 256, 2816, 2400 * 1792, 32   # the model card's largest sizes are ~4.3 MP
@@ -93,6 +133,7 @@ class ImagesConfig:
     port: int = 8099                            # on 127.0.0.1 only
     cap_gib: int = 40                           # Windows: the hard cap of its working set, from its start
     log: str | None = None                      # its output; next to the engine's log by default
+    ffmpeg: str | None = None                   # ffmpeg: a video job's AVI made MP4 for the page; video needs it
 
 
 @dataclass
@@ -107,6 +148,9 @@ class Job:
     progress: dict = field(default_factory=dict)
     preview: str | None = None      # base64 PNG of the newest preview frame
     images: list = field(default_factory=list)   # base64 PNGs
+    video: bytes | None = None      # a video job's MP4 (served apart: GET /api/images/jobs/{id}/video)
+    poster: bytes | None = None     # its first frame as a JPEG (GET /api/images/jobs/{id}/poster): the gallery's thumbnail
+    video_info: dict | None = None  # its frames, fps and bytes
     error: str | None = None
     remote: str | None = None       # sd-server's job id
     cancel: bool = False
@@ -116,7 +160,11 @@ class Job:
         out = {"id": self.id, "state": self.state, "source": self.source, "created": self.created, "started": self.started,
                "finished": self.finished, "params": {k: v for k, v in self.params.items() if k != "refs"},
                "refs": len(self.params.get("refs") or []), "progress": self.progress, "preview": self.preview,
-               "error": self.error, "count": len(self.images), "now": time.time()}
+               "error": self.error, "count": len(self.images), "now": time.time(),
+               "kind": MODELS.get(self.params.get("model"), {}).get("kind", "image")}
+        if self.video is not None:
+            out["video"] = dict(self.video_info or {}, bytes=len(self.video), mime="video/mp4",
+                                poster=len(self.poster) if self.poster else 0)
         if with_images:
             out["images"] = list(self.images)
         return out
@@ -144,6 +192,15 @@ def check(req: dict) -> dict:
     if width * height > AREA_MAX:
         raise ImagesError(f"size: {width}x{height} is more than {AREA_MAX:,} pixels")
     out = {"prompt": prompt, "model": model, "width": width, "height": height}
+    m = MODELS[model]
+    if m.get("kind") == "video":                     # a video: its frames (1 + 4k), one at a time, one start image
+        frames = req.get("frames", 49)
+        step, top = m.get("frames_step", 4), m.get("frames_max", 121)
+        if isinstance(frames, bool) or not isinstance(frames, int) or not step + 1 <= frames <= top or (frames - 1) % step:
+            raise ImagesError(f"frames: from {step + 1} to {top}, one more than a multiple of {step}")
+        out["frames"] = frames
+        if req.get("count", 1) != 1:
+            raise ImagesError("count: a video is made one at a time")
     neg = req.get("negative_prompt")
     if neg is not None:
         if not isinstance(neg, str) or len(neg) > PROMPT_MAX:
@@ -169,8 +226,9 @@ def check(req: dict) -> dict:
         raise ImagesError(f"count: from 1 to {COUNT_MAX}")
     out["count"] = count
     refs = req.get("refs") or []
-    if not isinstance(refs, list) or len(refs) > REFS_MAX:
-        raise ImagesError(f"refs: {REFS_MAX} reference images at most")
+    refs_max = m.get("refs_max", REFS_MAX)
+    if not isinstance(refs, list) or len(refs) > refs_max:
+        raise ImagesError(f"refs: {refs_max} reference images at most" if refs_max > 1 else "refs: one start image at most")
     clean = []
     for i, r in enumerate(refs):
         if not isinstance(r, str) or not DATA_URL.match(r):
@@ -232,7 +290,8 @@ def refusal(params: dict, model: dict) -> str | None:
     if model["refs"] == "required" and not params.get("refs"):
         return f"refs: the {label} model edits images: add the image to edit"
     if model.get("area_max") and params["width"] * params["height"] > model["area_max"]:
-        return f"size: the {label} model makes images of {model['area_max'] / 1e6:.1f} megapixels at most here"
+        quoi = "videos" if model.get("kind") == "video" else "images"
+        return f"size: the {label} model makes {quoi} of {model['area_max'] / 1e6:.1f} megapixels at most here"
     if model.get("refs_area_max") and params.get("refs"):
         total = 0
         for i, r in enumerate(params["refs"]):
@@ -272,6 +331,7 @@ class Images:
         self.lock = threading.Lock()
         self.proc = None
         self.server_state = "stopped"           # stopped, starting, ready
+        self.loaded_kind: str | None = None     # "image" or "video": the kind of the last model sd-server ran (the pill)
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
         self.queue: list[Job] = []
@@ -301,8 +361,9 @@ class Images:
                 found = [f for f in sorted((root / folder).glob(glob)) if f.is_file()]
                 if found:
                     loras.append((found[0].name, lo["multiplier"]))
-            if (all(k in slots for k in REQUIRED_SLOTS) and (m["refs"] != "required" or "llm_vision" in slots)
-                    and len(loras) == len(m.get("loras", ()))):
+            if (all(k in slots for k in m.get("required", REQUIRED_SLOTS)) and (m["refs"] != "required" or "llm_vision" in slots)
+                    and len(loras) == len(m.get("loras", ()))
+                    and (m.get("kind") != "video" or (self.cfg.ffmpeg and Path(self.cfg.ffmpeg).is_file()))):
                 out[name] = {**slots, **({"@loras": loras} if loras else {})}
         return out
 
@@ -316,8 +377,12 @@ class Images:
         return {"configured": True, "server": server, "card": self.cfg.card,
                 "models": {k: {"label": v["label"], "description": v["description"], "available": k in files,
                                "steps": v["steps"], "cfg": v["cfg"], "fixed": v["fixed"], "refs": v["refs"],
-                               "edit": "llm_vision" in files.get(k, {}), "fast": bool(v.get("loras")),
-                               "refs_area_max": v.get("refs_area_max"), "area_max": v.get("area_max")}
+                               "edit": "llm_vision" in files.get(k, {}) or v.get("kind") == "video", "fast": bool(v.get("loras")),
+                               "refs_area_max": v.get("refs_area_max"), "area_max": v.get("area_max"),
+                               "kind": v.get("kind", "image"), "fps": v.get("fps"), "frames_max": v.get("frames_max"),
+                               "frames_step": v.get("frames_step"), "refs_max": v.get("refs_max", REFS_MAX),
+                               "negative_default": bool(v.get("negative_default")), "decode_us_per_px": v.get("decode_us_per_px"),
+                               "audio": bool(v.get("audio")), "decode_audio_s_per_frame": v.get("decode_audio_s_per_frame")}
                            for k, v in MODELS.items()},
                 "limits": {"side_min": SIDE_MIN, "side_max": SIDE_MAX, "area_max": AREA_MAX, "multiple": MULTIPLE,
                            "refs_max": REFS_MAX, "count_max": COUNT_MAX, "steps_max": STEPS_MAX, "cfg_max": CFG_MAX},
@@ -330,17 +395,20 @@ class Images:
             run = next((j for j in self.jobs.values() if j.state in ("waiting", "switching", "starting", "generating")), None)
             queued = sum(1 for j in self.jobs.values() if j.state == "queued")
             server = self.server_state if self._alive() else "stopped"
+            # the kind of model the cards hold: "Video model loaded" after a video, in every tab's pill
+            loaded = self.loaded_kind if server == "ready" else None
             job = None if run is None else {"id": run.id, "state": run.state, "source": run.source, "progress": dict(run.progress),
                                             "model": run.params["model"], "width": run.params["width"],
-                                            "height": run.params["height"], "count": run.params["count"]}
-        return {"server": server, "job": job, "queued": queued}
+                                            "height": run.params["height"], "count": run.params["count"],
+                                            "kind": MODELS.get(run.params["model"], {}).get("kind", "image")}
+        return {"server": server, "job": job, "queued": queued, "loaded": loaded}
 
     # ------------------------------------------------------------------------------------------------- the jobs
     def submit(self, params: dict, source: str = "page") -> Job:
         files = self.files()
         if params["model"] not in files:
             raise ImagesError(f"the {MODELS[params['model']]['label']} files are not in {self.cfg.models}")
-        if params.get("refs") and "llm_vision" not in files[params["model"]]:
+        if params.get("refs") and MODELS[params["model"]].get("kind") != "video" and "llm_vision" not in files[params["model"]]:
             raise ImagesError("editing with reference images needs the vision projector (mmproj) in text_encoders/")
         non = refusal(params, MODELS[params["model"]])
         if non:
@@ -433,15 +501,23 @@ class Images:
     def _generate(self, job: Job) -> None:
         p, files = job.params, self.files()
         model = MODELS[p["model"]]
+        video = model.get("kind") == "video"
         slots = {k: v for k, v in files[p["model"]].items() if not k.startswith("@")}
         body = {"prompt": p["prompt"], "width": p["width"], "height": p["height"], "seed": p["seed"],
-                "batch_count": p["count"], "preview": PREVIEW_MODE, "preview_interval": 1, "output_format": "png",
+                "preview": PREVIEW_MODE, "preview_interval": 1, "output_format": "avi" if video else "png",
                 "model": {"recipe": model["recipe"], "models": slots}}
+        if video:                                    # one sequence: its frames, the model's frame rate, a start image
+            body.update(video_frames=p["frames"], fps=model["fps"])
+            if p.get("refs"):
+                body["init_image"] = p["refs"][0]
+        else:
+            body["batch_count"] = p["count"]
         if files[p["model"]].get("@loras"):
             body["lora"] = self._loras(files[p["model"]]["@loras"])
-        if p.get("negative_prompt"):
-            body["negative_prompt"] = p["negative_prompt"]
-        if p.get("refs"):
+        neg = p.get("negative_prompt") or model.get("negative_default")
+        if neg:
+            body["negative_prompt"] = neg
+        if p.get("refs") and not video:
             body["ref_images"] = p["refs"]
         sample = {}
         send = model.get("send", True)                  # the Turbo keeps its recipe's own 8-step schedule
@@ -456,10 +532,11 @@ class Images:
         # (soir) what sd-server reads for this job: after a change of model it reads the other model's files (~17 GB for
         # the Turbo; 3 min 15 s from a hard disk, measured) under its "preparing" stage: shown, measured, as it goes
         read0, size = _read_bytes(self.proc), self._files_size(files[p["model"]])
-        code, out = self._http("POST", "/sdcpp/v1/img_gen", body)
+        code, out = self._http("POST", "/sdcpp/v1/vid_gen" if video else "/sdcpp/v1/img_gen", body)
         if code != 202 or not isinstance(out, dict) or "id" not in out:
             return self._finish(job, "failed", _remote_error(out) or f"the image server refused the job ({code})")
         job.remote, job.state = out["id"], "generating"
+        self.loaded_kind = model.get("kind", "image")
         cancel_sent = False
         while True:
             time.sleep(0.5)
@@ -481,11 +558,44 @@ class Images:
                 job.preview = pv["b64_json"]
             status = st.get("status")
             if status == "completed":
-                job.images = [im.get("b64_json") for im in ((st.get("result") or {}).get("images") or []) if im.get("b64_json")]
+                res = st.get("result") or {}
+                if video:
+                    try:
+                        avi = base64.b64decode(res.get("b64_json") or "")
+                        job.video, job.poster = self._mp4(avi)
+                    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as e:
+                        job.preview = None
+                        return self._finish(job, "failed", f"the video could not be made MP4: {e}")
+                    # with its sound: the AVI's own stream headers say it ("auds", LTX-2.3's PCM track)
+                    job.video_info = {"frames": res.get("frame_count"), "fps": res.get("fps") or model["fps"],
+                                      "audio": b"auds" in avi[:65536]}
+                else:
+                    job.images = [im.get("b64_json") for im in (res.get("images") or []) if im.get("b64_json")]
                 job.preview = None
                 return self._finish(job, "completed")
             if status in ("failed", "cancelled"):
                 return self._finish(job, status, _remote_error(st) or status)
+
+    def _mp4(self, avi: bytes) -> tuple[bytes, bytes | None]:
+        """sd-server's AVI (MJPEG frames, and PCM sound for a model that makes it) as an MP4 every browser plays
+        (H.264, AAC): ffmpeg, measured at 0.2 to 0.3 s for 33 frames, 4 to 5 times lighter; and, by the same
+        call, its first frame as a JPEG (the gallery's thumbnail, whatever video the browser can read)."""
+        if not avi[:4] == b"RIFF":
+            raise RuntimeError("the image server gave no AVI")
+        with tempfile.TemporaryDirectory(prefix="lapilli-video-") as d:
+            src, dst, img = Path(d) / "in.avi", Path(d) / "out.mp4", Path(d) / "poster.jpg"
+            src.write_bytes(avi)
+            # "scale=out_range=tv": the MJPEG frames are full range; ffmpeg 8 keeps it in the MP4 (yuvj420p, measured)
+            # where many players show it washed out or too dark: the standard range, the same colors (2 of 255 apart,
+            # as the full range: the compression's), 10 % lighter
+            r = subprocess.run([self.cfg.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(src),
+                                "-vf", "scale=out_range=tv", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-preset", "medium",
+                                "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(dst),
+                                "-map", "0:v:0", "-frames:v", "1", "-q:v", "3", str(img)],
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=600)
+            if r.returncode or not dst.is_file():
+                raise RuntimeError((r.stderr or b"").decode("utf-8", "replace").strip()[-300:] or f"ffmpeg ended with {r.returncode}")
+            return dst.read_bytes(), (img.read_bytes() if img.is_file() else None)
 
     def _files_size(self, model_files: dict) -> int:
         """The bytes of a model's files (its slots and its LoRAs): what sd-server reads when it changes to this model."""
@@ -525,6 +635,7 @@ class Images:
                        "--listen-port", str(self.cfg.port), "-W", "1024", "-H", "1024"]
         log = self.cfg.log or os.path.join(os.path.dirname(os.path.abspath(self.cfg.models)), "sd-server.log")
         self.server_state = "starting"
+        self.loaded_kind = None
         with open(log, "ab") as out:
             self.proc = lifeline.popen(args, env=env, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         _cap(self.proc, self.cfg.cap_gib)

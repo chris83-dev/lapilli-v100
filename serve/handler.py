@@ -392,6 +392,23 @@ def make_handler(target: Service | Router):
                 if self._authorized():
                     im = getattr(router, "images", None)
                     self._json(200, im.state() if im else {"configured": False})
+            elif path.startswith("/api/images/jobs/") and path.endswith(("/video", "/poster")):
+                # a video job's MP4, and its first frame as a JPEG (the gallery's thumbnail)
+                if self._authorized():
+                    im = getattr(router, "images", None)
+                    jid, part = path[len("/api/images/jobs/"):].rsplit("/", 1)
+                    job = im.get(jid) if im else None
+                    data = getattr(job, part, None) if job is not None else None
+                    if not data:
+                        self._json(404, {"error": {"message": f"no {part} for this job"}})
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "video/mp4" if part == "video" else "image/jpeg")
+                        self._cors()
+                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        self.wfile.write(data)
             elif path.startswith("/api/images/jobs/"):       # one job; ?images=0 leaves its images out (polling)
                 if self._authorized():
                     im = getattr(router, "images", None)

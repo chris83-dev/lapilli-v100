@@ -24,6 +24,10 @@ def _png() -> str:
 
 
 PNG = _png()
+# a video job's result: a tiny real MJPEG AVI (5 frames of 64×64, made by ffmpeg), as sd-server gives one
+AVI = base64.b64encode(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiny.avi"), "rb").read()).decode()
+# LTX-2.3's AVI carries its sound: 5 MJPEG frames and 0.21 s of PCM, stereo 48 kHz (a 440 Hz tone)
+AVI_SON = base64.b64encode(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiny-son.avi"), "rb").read()).decode()
 STEPS = 4
 LOG = os.environ.get("FAKE_SD_LOG")
 MODEL_DIR = None
@@ -79,7 +83,9 @@ class H(BaseHTTPRequestHandler):
                 out = {"id": jid, "kind": "img_gen", "status": j["status"],
                        "progress": {"stage": "sampling", "completed": min(j["polls"], STEPS), "total": STEPS, "unit": "steps"},
                        "preview": {"pass": 1, "step": j["polls"], "total_steps": STEPS, "b64_json": PNG} if j["status"] == "generating" else None,
-                       "result": {"output_format": "png", "images": [{"index": i, "b64_json": PNG} for i in range(j["count"])]}
+                       "result": ({"output_format": "avi", "mime_type": "video/x-msvideo", "fps": j["fps"], "frame_count": 5,
+                                   "b64_json": AVI_SON if j.get("son") else AVI} if j["video"] else
+                                  {"output_format": "png", "images": [{"index": i, "b64_json": PNG} for i in range(j["count"])]})
                        if j["status"] == "completed" else None,
                        "error": {"code": "cancelled", "message": "job cancelled by client"} if j["status"] == "cancelled" else None}
             return self.send(200, out)
@@ -88,8 +94,9 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
-        if self.path == "/sdcpp/v1/img_gen":
-            note({"img_gen": body})
+        if self.path in ("/sdcpp/v1/img_gen", "/sdcpp/v1/vid_gen"):
+            video = self.path.endswith("vid_gen")
+            note({"vid_gen" if video else "img_gen": body})
             with lock:
                 jid = f"job_{len(jobs) + 1}"
                 recipe = (body.get("model") or {}).get("recipe")
@@ -98,7 +105,8 @@ class H(BaseHTTPRequestHandler):
                     load = list(((body.get("model") or {}).get("models") or {}).values()) + [
                         "loras/" + x["path"] for x in body.get("lora") or []]
                     loaded["recipe"] = recipe
-                jobs[jid] = {"polls": 0, "cancel": False, "status": "queued", "count": body.get("batch_count", 1), "load": load}
+                jobs[jid] = {"polls": 0, "cancel": False, "status": "queued", "count": body.get("batch_count", 1), "load": load,
+                             "video": video, "fps": body.get("fps", 16), "son": video and str(recipe).startswith("ltx")}
             return self.send(202, {"id": jid, "kind": "img_gen", "status": "queued", "poll_url": f"/sdcpp/v1/jobs/{jid}"})
         if self.path.startswith("/sdcpp/v1/jobs/") and self.path.endswith("/cancel"):
             jid = self.path.split("/")[-2]

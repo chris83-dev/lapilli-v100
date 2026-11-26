@@ -610,6 +610,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "the page's Images tab and POST /v1/images/generations")
     ap.add_argument("--images-models", default="", metavar="DIR",
                     help="the image models directory (diffusion_models/, text_encoders/, vae/) for --images-server")
+    ap.add_argument("--images-ffmpeg", default="", metavar="EXE",
+                    help="ffmpeg: a video job's AVI (sd-server) made MP4 for the page; the video models need it")
     ap.add_argument("--images-card", type=int, default=0, metavar="N",
                     help="the one card the image server may use (default 0)")
     ap.add_argument("--images-port", type=int, default=8099, metavar="PORT",
